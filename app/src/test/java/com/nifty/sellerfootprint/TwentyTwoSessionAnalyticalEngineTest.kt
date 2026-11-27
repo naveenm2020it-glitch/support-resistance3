@@ -80,7 +80,7 @@ class TwentyTwoSessionAnalyticalEngineTest {
                 }
                 val peSettle = if (k == 22800.0) 6.5 else 48.0
 
-                // Strong Call walls at 24300 (R1) and 24500 (R2), plus breached short-covering at 24000 CE (P6 veto)
+                // Strong Call walls at 24300 (R1) and 24500 (R2) clear the chain-wide impulse threshold; 24000 CE is P6-vetoed
                 val ceOi = when (k) {
                     24300.0 -> 15000L
                     24500.0 -> 13000L
@@ -89,7 +89,7 @@ class TwentyTwoSessionAnalyticalEngineTest {
                 }
                 val ceDelta = when (k) {
                     24300.0 -> 3600L
-                    24500.0 -> 2900L
+                    24500.0 -> 3300L
                     24000.0 -> if (idx == 21) -4200L else 200L // P6 short-covering capitulation on Session 22
                     else -> 140L
                 }
