@@ -42,7 +42,7 @@ jobs:
           gradle-version: '8.7'
 
       - name: Apply the eight checksum-verified source files
-        if: github.ref_name == 'apply-nifty-seller-patch'
+        if: github.ref_name == 'apply-nifty-seller-patch' && hashFiles('support-resistance3-main-nifty-seller-intelligence-patched.zip') != ''
         shell: bash
         run: |
           python3 - <<'PY'
