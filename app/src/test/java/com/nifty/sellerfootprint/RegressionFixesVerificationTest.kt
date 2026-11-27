@@ -370,8 +370,8 @@ class RegressionFixesVerificationTest {
                 val peChg = if (k == 24000) 195_000L else 26_000L
                 val ceOi = if (k == 24300) 950_000L else 260_000L
                 val ceChg = if (k == 24300) 227_500L else 32_500L
-                sb.append("$tradeDate,IDO,NIFTY,$expiryDate,$expiryDate,$k,PE,75,80,60,62,74,24150.50,62,$peOi,$peChg,975000,60450000,2500,65\\n")
-                sb.append("$tradeDate,IDO,NIFTY,$expiryDate,$expiryDate,$k,CE,72,78,58,60,71,24150.50,60,$ceOi,$ceChg,975000,58500000,2500,65\\n")
+                sb.append("$tradeDate,IDO,NIFTY,$expiryDate,$expiryDate,$k,PE,75,80,60,62,74,24150.50,62,$peOi,$peChg,975000,60450000,2500,65\n")
+                sb.append("$tradeDate,IDO,NIFTY,$expiryDate,$expiryDate,$k,CE,72,78,58,60,71,24150.50,60,$ceOi,$ceChg,975000,58500000,2500,65\n")
             }
             return Result.success(sb.toString())
         }
