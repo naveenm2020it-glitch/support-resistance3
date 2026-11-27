@@ -213,11 +213,10 @@ class RegressionFixesVerificationTest {
     fun nseReportParsers_handlesBomQuotesRejectsBadParticipantHeadersAndSanitizesNonFiniteNumbers() {
         val tradeDate = LocalDate.of(2026, 3, 9)
 
-        val bomQuotedParticipantOi = "﻿" +
-            ""Client Type","Future Index Long","Future Index Short","Option Index Call Long","Option Index Put Long","Option Index Call Short","Option Index Put Short"
-" +
-            ""FII",1000,1200,3000,3500,4100,4600
-"
+        val bomQuotedParticipantOi = "\uFEFF" + """
+            "Client Type","Future Index Long","Future Index Short","Option Index Call Long","Option Index Put Long","Option Index Call Short","Option Index Put Short"
+            "FII",1000,1200,3000,3500,4100,4600
+        """.trimIndent()
         val validParticipant = NseReportParsers.parseParticipantOiCsv(bomQuotedParticipantOi, tradeDate)
         assertEquals(1, validParticipant.size)
         assertEquals("FII", validParticipant[0].clientType)
@@ -362,18 +361,17 @@ class RegressionFixesVerificationTest {
         override fun downloadUdiffBhavcopyCsv(tradeDate: LocalDate): Result<String> {
             if (tradeDate !in validDates) return Result.failure(IOException("404 Holiday"))
             val sb = StringBuilder(
-                "TradDt,FinInstrmTp,TckrSymb,XpryDt,FininstrmActlXpryDt,StrkPric,OptnTp,OpnPric,HghPric,LwPric,ClsPric,PrvsClsgPric,UndrlygPric,SttlmPric,OpnIntrst,ChngInOpnIntrst,TtlTradgVol,TtlTrfVal,TtlNbOfTxsExctd,NewBrdLotQty
-"
+                """
+                TradDt,FinInstrmTp,TckrSymb,XpryDt,FininstrmActlXpryDt,StrkPric,OptnTp,OpnPric,HghPric,LwPric,ClsPric,PrvsClsgPric,UndrlygPric,SttlmPric,OpnIntrst,ChngInOpnIntrst,TtlTradgVol,TtlTrfVal,TtlNbOfTxsExctd,NewBrdLotQty
+                """.trimIndent() + "\n"
             )
             for (k in listOf(23800, 23900, 24000, 24100, 24200, 24300, 24400)) {
                 val peOi = if (k == 24000) 900_000L else 250_000L
                 val peChg = if (k == 24000) 195_000L else 26_000L
                 val ceOi = if (k == 24300) 950_000L else 260_000L
                 val ceChg = if (k == 24300) 227_500L else 32_500L
-                sb.append("$tradeDate,IDO,NIFTY,$expiryDate,$expiryDate,$k,PE,75,80,60,62,74,24150.50,62,$peOi,$peChg,975000,60450000,2500,65
-")
-                sb.append("$tradeDate,IDO,NIFTY,$expiryDate,$expiryDate,$k,CE,72,78,58,60,71,24150.50,60,$ceOi,$ceChg,975000,58500000,2500,65
-")
+                sb.append("$tradeDate,IDO,NIFTY,$expiryDate,$expiryDate,$k,PE,75,80,60,62,74,24150.50,62,$peOi,$peChg,975000,60450000,2500,65\\n")
+                sb.append("$tradeDate,IDO,NIFTY,$expiryDate,$expiryDate,$k,CE,72,78,58,60,71,24150.50,60,$ceOi,$ceChg,975000,58500000,2500,65\\n")
             }
             return Result.success(sb.toString())
         }
@@ -381,34 +379,32 @@ class RegressionFixesVerificationTest {
         override fun downloadParticipantOiCsv(tradeDate: LocalDate): Result<String> {
             if (failOptionalStreams || tradeDate !in validDates) return Result.failure(IOException("404"))
             return Result.success(
-                "Client Type,Option Index Call Long,Option Index Put Long,Option Index Call Short,Option Index Put Short
-" +
-                    "FII,100000,100000,160000,170000
-" +
-                    "Pro,200000,200000,260000,270000
-"
+                """
+                Client Type,Option Index Call Long,Option Index Put Long,Option Index Call Short,Option Index Put Short
+                FII,100000,100000,160000,170000
+                Pro,200000,200000,260000,270000
+                """.trimIndent()
             )
         }
 
         override fun downloadIndexSnapshotCsv(tradeDate: LocalDate): Result<String> {
             if (failOptionalStreams || tradeDate !in validDates) return Result.failure(IOException("404"))
             return Result.success(
-                "Index Name,Open Index Value,High Index Value,Low Index Value,Closing Index Value,Points Change,Change(%)
-" +
-                    "Nifty 50,24100.0,24190.0,24080.0,24150.50,45.0,0.19
-" +
-                    "India VIX,13.5,13.9,13.1,13.3,-0.2,-1.48
-"
+                """
+                Index Name,Open Index Value,High Index Value,Low Index Value,Closing Index Value,Points Change,Change(%)
+                Nifty 50,24100.0,24190.0,24080.0,24150.50,45.0,0.19
+                India VIX,13.5,13.9,13.1,13.3,-0.2,-1.48
+                """.trimIndent()
             )
         }
 
         override fun downloadFoVolatilityCsv(tradeDate: LocalDate): Result<String> {
             if (failOptionalStreams || tradeDate !in validDates) return Result.failure(IOException("404"))
             return Result.success(
-                "Symbol,Underlying Close Price (A),Current Day Underlying Daily Volatility (E),Applicable Annualised Volatility (F) = E * Sqrt(365)
-" +
-                    "NIFTY,24150.50,0.0085,0.1624
-"
+                """
+                Symbol,Underlying Close Price (A),Current Day Underlying Daily Volatility (E),Applicable Annualised Volatility (F) = E * Sqrt(365)
+                NIFTY,24150.50,0.0085,0.1624
+                """.trimIndent()
             )
         }
     }
