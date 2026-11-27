@@ -23,6 +23,8 @@ jobs:
         if: hashFiles('nifty-seller-intelligence-support-resistance3-patch.zip.b64') != ''
         run: |
           base64 --decode nifty-seller-intelligence-support-resistance3-patch.zip.b64 > "$RUNNER_TEMP/nifty-seller-intelligence-patch.zip"
+          printf '%s  %s\n' '1e272b11d9bf5e1c0148b23d41350ad38589a887f6b7edf869f97b4f476f103d' "$RUNNER_TEMP/nifty-seller-intelligence-patch.zip" | sha256sum -c -
+          unzip -t "$RUNNER_TEMP/nifty-seller-intelligence-patch.zip"
           unzip -o "$RUNNER_TEMP/nifty-seller-intelligence-patch.zip" -d .
           rm nifty-seller-intelligence-support-resistance3-patch.zip.b64
           git config user.name "github-actions[bot]"
