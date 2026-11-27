@@ -235,7 +235,12 @@ object PatternDiscoveryEngine {
             reconciledFromPhase1.filter { it.status != PatternValidationStatus.REJECTED_OVERFITTED } +
                 ledgerC
             )
-        val activePatternIds = combinedLedgerD.map { it.patternId }.toSet()
+        // P6 (short-covering veto) and P7 (tail-wing noise filter) are deterministic
+        // guardrails. Keep them active even when the earlier discovery windows had no trigger.
+        val activePatternIds = combinedLedgerD.map { it.patternId }.toSet() + setOf(
+            PatternId.P6_SHORT_COVERING_CAPITULATION,
+            PatternId.P7_TAIL_WING_MARGIN_HEDGE
+        )
         val activeDirectionalPatternIds = activePatternIds.filter {
             it != PatternId.P6_SHORT_COVERING_CAPITULATION && it != PatternId.P7_TAIL_WING_MARGIN_HEDGE
         }.toSet()

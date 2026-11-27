@@ -300,7 +300,8 @@ class RegressionFixesVerificationTest {
         val analysis = recoveryResult.getOrThrow()
         assertEquals(22, analysis.auditSummary.sessionWindowDates.size)
         assertEquals(24150.50, analysis.niftyClose, 0.001)
-        assertEquals(2, analysis.activeStreamsCount)
+        // Only the Options Bhavcopy is available: the futures and four optional feeds are absent.
+        assertEquals(1, analysis.activeStreamsCount)
         assertTrue(analysis.dataStatusMessage.contains("22 downloaded, 0 cached"))
 
         val healedBhavcopy = recoveryStorage.readSessionReportIfCached(targetDate, TempStorageManager.BHAVCOPY_FILE)
