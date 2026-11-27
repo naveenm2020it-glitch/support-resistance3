@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -50,3 +50,14 @@ jobs:
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish direct APK download on GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-build-${{ github.run_number }}
+          name: NIFTY Seller Footprint APK build ${{ github.run_number }}
+          body: | 
+            APK generated after successful unit tests and Android debug build.
+            Download the APK asset directly below; no artifact ZIP extraction required.
+          files: app/build/outputs/apk/debug/app-debug.apk
+          make_latest: true
