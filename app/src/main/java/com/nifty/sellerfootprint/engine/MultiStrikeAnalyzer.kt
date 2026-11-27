@@ -194,8 +194,7 @@ object MultiStrikeAnalyzer {
             sameFiniteOrBothNonFinite(a.closePrice, b.closePrice) &&
             sameFiniteOrBothNonFinite(a.prevClosePrice, b.prevClosePrice) &&
             sameFiniteOrBothNonFinite(a.settlePrice, b.settlePrice) &&
-            sameFiniteOrBothNonFinite(a.underlyingPrice, b.underlyingPrice) &&
-            sameFiniteOrBothNonFinite(a.totalTurnoverValue, b.totalTurnoverValue, eps = 1e-2)
+            sameFiniteOrBothNonFinite(a.underlyingPrice, b.underlyingPrice)
     }
 
     private fun areFuturesSnapshotsIdentical(a: FuturesContractRecord, b: FuturesContractRecord): Boolean {
