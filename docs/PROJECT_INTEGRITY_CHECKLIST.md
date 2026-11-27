@@ -1,0 +1,37 @@
+# Project-Integrity Audit Checklist
+
+- [x] **All 10 Existing Source Fixes Preserved:** Verified byte-for-byte preservation of `AnalysisHistoryStore.kt`, `ExpiryResolver.kt`, `NiftyLotSizeResolver.kt`, `NseDataRepository.kt`, `NseNetworkClient.kt`, `NseReportParsers.kt`, `TradingCalendarEngine.kt`, `AnalysisOrchestrator.kt`, and `DomainModels.kt`, plus backward-compatible `fileDeleter` injection in `TempStorageManager.kt`.
+- [x] **Domain Models (`DomainModels.kt`):** Complete immutable data structures for option/futures contracts, participant OI & volume, index snapshots, volatility, expiries, microstructure metrics, patterns (`P1`–`P7`, `NP1`–`NP3`), zones (`S1`, `S2`, `R1`, `R2`), and research audit trails.
+- [x] **Data & Calendar Layer:**
+  - [x] `NiftyLotSizeResolver.kt` (Report `NewBrdLotQty` + verified SEBI/NSE circular schedule + explicit `UNAVAILABLE` handling)
+  - [x] `TradingCalendarEngine.kt` (IST validation, weekend & 2024–2026 holiday filtering, scalable backward window generator)
+  - [x] `ExpiryResolver.kt` (`resolveFromContracts` with unavailable-lot tracking + pre-download Sep-2025 Thursday/Tuesday calendar preview)
+  - [x] `NseReportFetcher.kt` & `NseNetworkClient.kt` (OkHttp cookie-jar session warmup + 6-stream UDiFF/legacy fallback URLs)
+  - [x] `NseReportParsers.kt` (ZIP extraction, BOM/quote-safe CSV parsing, non-finite number sanitization, schema validation)
+  - [x] `TempStorageManager.kt` & `NseDataRepository.kt` (22-session assembly, pre-cache validation, self-healing cache, tracked isolated cleanup)
+  - [x] `AnalysisHistoryStore.kt` (9-column `analysis_history_v1.tsv` persistence in `filesDir`, `Locale.US` safe + comma-decimal backward compatible)
+- [x] **Analytical Engine Layer:**
+  - [x] `MultiStrikeAnalyzer.kt` (95% cumulative OI mass + 2.5-sigma volatility envelope, Z-score, PRR, IPRR, ATS, persistence, vertical/cross-expiry roll linkage)
+  - [x] `PatternDiscoveryEngine.kt` (4-phase split: `Sessions 1–17` discovery, `Sessions 18–21` validation & novel discovery, `Ledger D` synthesis, `Session 22` blind test)
+  - [x] `ZoneDerivationEngine.kt` (Non-overlapping narrow `S1`, `S2`, `R1`, `R2` zones with DTE-weighted premium cushion & evidence grading)
+  - [x] `AnalysisOrchestrator.kt` (End-to-end execution, bounded 6-stream tracking & audit summary assembly)
+- [x] **UI Layer:**
+  - [x] `MainActivity.kt`, `MainViewModel.kt`, `MainScreen.kt`, `Theme.kt` (Single-screen Material 3 Compose UI with DatePicker, Expiry dropdown, 4 Zone cards, Audit Trail, History, Theme toggle, and Delete Temporary Files confirmation dialog)
+- [x] **JUnit 4 Test Suite (`app/src/test/java/com/nifty/sellerfootprint/`):**
+  - [x] `TradingCalendarAndExpiryTest.kt`
+  - [x] `NseParsersStorageAndHistoryTest.kt`
+  - [x] `TwentyTwoSessionAnalyticalEngineTest.kt`
+  - [x] `RegressionFixesVerificationTest.kt` (7 regression tests verified against actual project signatures)
+- [x] **Gradle, Resources & CI/CD (Restored & Complete):**
+  - [x] `build.gradle.kts`, `settings.gradle.kts`, `gradle.properties`, `app/build.gradle.kts`, `app/proguard-rules.pro`
+  - [x] `gradlew` (executable `0755`), `gradlew.bat`, `gradle/wrapper/gradle-wrapper.properties`
+  - [x] `AndroidManifest.xml`, `strings.xml`, `themes.xml`, `ic_launcher_foreground.xml`, `ic_launcher_background.xml`, `mipmap-anydpi-v26/ic_launcher*.xml`
+  - [x] `.github/workflows/build-apk.yml` & `.gitignore`
+- [x] **Documentation (`README.md` & `docs/`):**
+  - [x] `README.md`
+  - [x] `docs/RESEARCH_METHODOLOGY.md`
+  - [x] `docs/NSE_DATA_SOURCES.md`
+  - [x] `docs/TESTING_REPORT.md`
+  - [x] `docs/TROUBLESHOOTING.md`
+  - [x] `docs/PROJECT_INTEGRITY_CHECKLIST.md`
+- [ ] **Local Gradle Test & APK Execution:** Not executed in packaging sandbox (`kotlinc`, `javac`, and `gradle` are absent); ready to execute via `./gradlew testDebugUnitTest assembleDebug` or GitHub Actions.
