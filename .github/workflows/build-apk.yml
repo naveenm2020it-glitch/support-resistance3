@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - apply-nifty-seller-patch
   workflow_dispatch:
 
 permissions:
@@ -11,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    name: Unit tests and Debug APK
+    name: Apply verified patch, run tests and build Debug APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -40,6 +41,50 @@ jobs:
         with:
           gradle-version: '8.7'
 
+      - name: Apply the eight checksum-verified source files
+        if: github.ref_name == 'apply-nifty-seller-patch'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import pathlib
+          import zipfile
+
+          archive = pathlib.Path("support-resistance3-main-nifty-seller-intelligence-patched.zip")
+          expected = {
+              "app/src/main/java/com/nifty/sellerfootprint/data/ExpiryResolver.kt": "951d873984a010643ce1d941acf19112bd0ecd7b604ef2afa43da8dfc8191bb0",
+              "app/src/main/java/com/nifty/sellerfootprint/engine/AnalysisOrchestrator.kt": "a86463bbc68224c87ae11d03e60d6e271b2d46bed3c6a71b1c094e4c9970082f",
+              "app/src/main/java/com/nifty/sellerfootprint/engine/MultiStrikeAnalyzer.kt": "65f906ccd60c3ad66878f1a8100d5764b6380d6672d60d5bb8aea1d55535a369",
+              "app/src/main/java/com/nifty/sellerfootprint/engine/PatternDiscoveryEngine.kt": "71543f818e9563d97ef40a37da4dc19aa1b9d59a0df73a485eb4b91260f4b3f9",
+              "app/src/main/java/com/nifty/sellerfootprint/engine/ZoneDerivationEngine.kt": "6c38f09a37fb1f7067710eb13fadc5820f580c03267e48c2c9cf1d4bdfd69c91",
+              "app/src/main/java/com/nifty/sellerfootprint/model/DomainModels.kt": "09d7ef7cf6353244b1590be20996ffb760655d9e5e40fd478f7f97337eb886be",
+              "app/src/test/java/com/nifty/sellerfootprint/RegressionFixesVerificationTest.kt": "166e4298d7b2ffcaf3bcf4a310e38541e1a42107389fe2ee95a23caa362fc745",
+              "app/src/test/java/com/nifty/sellerfootprint/TwentyTwoSessionAnalyticalEngineTest.kt": "9414f818cb7f74e9656d3382edb635340b62e4514c663d6730f68e33b4481029",
+          }
+          if not archive.is_file():
+              raise SystemExit(f"Expected patch archive not found: {archive}")
+          with zipfile.ZipFile(archive) as zf:
+              names = zf.namelist()
+              for relative, expected_sha in expected.items():
+                  matches = [name for name in names if name.endswith("/" + relative)]
+                  if len(matches) != 1:
+                      raise SystemExit(f"Expected exactly one archive entry for {relative}; found {matches}")
+                  data = zf.read(matches[0])
+                  actual_sha = hashlib.sha256(data).hexdigest()
+                  if actual_sha != expected_sha:
+                      raise SystemExit(f"Checksum mismatch for {relative}: {actual_sha}")
+                  target = pathlib.Path(relative)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(data)
+                  print(f"Verified and applied {relative}")
+          archive.unlink()
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/nifty/sellerfootprint/data/ExpiryResolver.kt app/src/main/java/com/nifty/sellerfootprint/engine/AnalysisOrchestrator.kt app/src/main/java/com/nifty/sellerfootprint/engine/MultiStrikeAnalyzer.kt app/src/main/java/com/nifty/sellerfootprint/engine/PatternDiscoveryEngine.kt app/src/main/java/com/nifty/sellerfootprint/engine/ZoneDerivationEngine.kt app/src/main/java/com/nifty/sellerfootprint/model/DomainModels.kt app/src/test/java/com/nifty/sellerfootprint/RegressionFixesVerificationTest.kt app/src/test/java/com/nifty/sellerfootprint/TwentyTwoSessionAnalyticalEngineTest.kt support-resistance3-main-nifty-seller-intelligence-patched.zip
+          git commit -m "Apply verified NIFTY seller intelligence patch"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
       - name: Run unit tests and assemble Debug APK
         run: gradle --no-daemon testDebugUnitTest assembleDebug
 
@@ -56,7 +101,7 @@ jobs:
         with:
           tag_name: apk-build-${{ github.run_number }}
           name: NIFTY Seller Footprint APK build ${{ github.run_number }}
-          body: | 
+          body: |
             APK generated after successful unit tests and Android debug build.
             Download the APK asset directly below; no artifact ZIP extraction required.
           files: app/build/outputs/apk/debug/app-debug.apk
