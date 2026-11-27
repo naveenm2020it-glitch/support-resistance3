@@ -9,9 +9,9 @@ enum class OptionSide {
 }
 
 enum class StrikeBelt(val label: String) {
-    CORE_GAMMA("Zone I: Core Gamma Belt (0% to 1.2%)"),
-    PRIMARY_WALL("Zone II: Primary Seller Wall Belt (1.2% to 3.5%)"),
-    TAIL_HEDGE("Zone III: Tail-Hedge Margin Wing (> 3.5%)")
+    CORE_GAMMA("Zone I: Core Gamma Belt (<= 0.75σ horizon, provisional)"),
+    PRIMARY_WALL("Zone II: Primary Seller Wall Belt (0.75σ–2.25σ horizon, provisional)"),
+    TAIL_HEDGE("Zone III: Tail-Hedge Margin Wing (> 2.25σ horizon, provisional)")
 }
 
 data class OptionContractRecord(
@@ -220,7 +220,8 @@ data class StrikeMicrostructureMetrics(
     val futuresAlignment: Double = 0.0, // [-1, +1] directional alignment from NIFTY Futures
     val isCrossExpiryRoll: Boolean = false, // True when front-expiry OI unwinds into next listed expiry
     val crossExpiryRollRatio: Double = 0.0,
-    val contradictionScore: Double = 0.0 // [0, 1] composite structural contradiction metric
+    val contradictionScore: Double = 0.0, // [0, 1] composite structural contradiction metric
+    val volNormalizedDistance: Double = 0.0 // |distanceFromSpotPct| / horizonSigmaPct (provisional σ-units)
 )
 
 enum class PatternId(

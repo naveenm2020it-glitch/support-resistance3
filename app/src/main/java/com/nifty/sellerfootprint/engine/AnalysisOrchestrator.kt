@@ -28,9 +28,11 @@ class AnalysisOrchestrator(
         val session21 = sessions[sessions.size - 2]
 
         onProgress("Resolving actual NSE expiries from Session 22 Bhavcopy...")
+        val session22OptionDedup = MultiStrikeAnalyzer.deduplicateOptionContractsWithAudit(session22.contracts)
+        val session22FuturesDedup = MultiStrikeAnalyzer.deduplicateFuturesContractsWithAudit(session22.futuresContracts)
         val availableExpiries = ExpiryResolver.resolveFromContracts(
             selectedTradingDate = selectedTradingDate,
-            contracts = session22.contracts
+            contracts = session22OptionDedup.deduplicatedContracts
         )
         if (availableExpiries.isEmpty()) {
             return Result.failure(
@@ -70,7 +72,13 @@ class AnalysisOrchestrator(
         val pctChange = session22.indexSnapshot?.percentChange
             ?: if (prevClose > 0.0) (ptsChange / prevClose) * 100.0 else 0.0
 
-        val nearFut = session22.nearMonthFutures
+        val nearFut = if (session22FuturesDedup.hasConflicts) {
+            null
+        } else {
+            session22FuturesDedup.deduplicatedContracts
+                .filter { !it.expiryDate.isBefore(session22.tradeDate) && it.effectivePrice > 0.0 }
+                .minByOrNull { it.expiryDate }
+        }
         val futClose = nearFut?.effectivePrice
         val futBasis = if (futClose != null && close > 0.0) futClose - close else null
         val futOiLots = nearFut?.openInterestLotsOrNull?.toLong()

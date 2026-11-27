@@ -9,6 +9,13 @@ import com.nifty.sellerfootprint.data.NseReportParsers
 import com.nifty.sellerfootprint.data.TempStorageManager
 import com.nifty.sellerfootprint.data.TradingCalendarEngine
 import com.nifty.sellerfootprint.engine.AnalysisOrchestrator
+import com.nifty.sellerfootprint.engine.MultiStrikeAnalyzer
+import com.nifty.sellerfootprint.engine.PatternDiscoveryEngine
+import com.nifty.sellerfootprint.engine.ZoneDerivationEngine
+import com.nifty.sellerfootprint.model.FuturesContractRecord
+import com.nifty.sellerfootprint.model.IndexSnapshotRecord
+import com.nifty.sellerfootprint.model.ParticipantOiRecord
+import com.nifty.sellerfootprint.model.ZoneEvidenceStrength
 import com.nifty.sellerfootprint.model.DailyVolatilityRecord
 import com.nifty.sellerfootprint.model.OptionContractRecord
 import com.nifty.sellerfootprint.model.OptionSide
@@ -307,6 +314,357 @@ class RegressionFixesVerificationTest {
         val healedBhavcopy = recoveryStorage.readSessionReportIfCached(targetDate, TempStorageManager.BHAVCOPY_FILE)
         assertNotNull(healedBhavcopy)
         assertTrue(healedBhavcopy!!.contains("NIFTY"))
+    }
+
+    // Test 8: Identical duplicate EOD option snapshots collapse into a single canonical row
+    // without summing OI/volume/turnover/trades while preserving CE and PE separation.
+    @Test
+    fun identicalDuplicateOptionSnapshots_collapseWithoutSummingAndPreserveCePeSeparation() {
+        val date = LocalDate.of(2026, 2, 10)
+        val expiry = LocalDate.of(2026, 2, 17)
+        val peRow = OptionContractRecord(
+            tradeDate = date,
+            expiryDate = expiry,
+            strikePrice = 24000.0,
+            optionType = OptionSide.PE,
+            openPrice = 60.0,
+            highPrice = 65.0,
+            lowPrice = 48.0,
+            closePrice = 50.0,
+            prevClosePrice = 60.0,
+            settlePrice = 50.0,
+            underlyingPrice = 24100.0,
+            openInterestUnits = 650_000L, // 10,000 lots
+            changeInOiUnits = 130_000L, // 2,000 lots
+            totalTradedVolumeUnits = 325_000L, // 5,000 lots
+            totalTurnoverValue = 16_250_000.0,
+            totalTradesExecuted = 1200L,
+            lotSize = 65
+        )
+        val ceRow = peRow.copy(optionType = OptionSide.CE)
+
+        val audit = MultiStrikeAnalyzer.deduplicateOptionContractsWithAudit(
+            listOf(peRow, peRow.copy(), ceRow, ceRow.copy())
+        )
+        assertFalse(audit.hasConflicts)
+        assertEquals(2, audit.deduplicatedContracts.size)
+
+        val dedupPe = audit.deduplicatedContracts.first { it.optionType == OptionSide.PE }
+        val dedupCe = audit.deduplicatedContracts.first { it.optionType == OptionSide.CE }
+        assertEquals(650_000L, dedupPe.openInterestUnits)
+        assertEquals(130_000L, dedupPe.changeInOiUnits)
+        assertEquals(325_000L, dedupPe.totalTradedVolumeUnits)
+        assertEquals(16_250_000.0, dedupPe.totalTurnoverValue, 1e-6)
+        assertEquals(1200L, dedupPe.totalTradesExecuted)
+        assertEquals(650_000L, dedupCe.openInterestUnits)
+
+        // ExpiryResolver must also not sum identical duplicate rows
+        val expiries = ExpiryResolver.resolveFromContracts(date, listOf(peRow, peRow.copy(), ceRow))
+        assertEquals(1, expiries.size)
+        assertEquals(2, expiries.first().totalActiveContracts)
+        assertEquals(20_000L, expiries.first().totalOpenInterestLots)
+    }
+
+    // Test 9: Conflicting duplicate EOD option snapshots for the same contract key are quarantined
+    // without summing, averaging, or picking by higher OI/volume/trades.
+    @Test
+    fun conflictingDuplicateOptionSnapshots_quarantinedWithoutSummingAveragingOrPicking() {
+        val date = LocalDate.of(2026, 2, 10)
+        val expiry = LocalDate.of(2026, 2, 17)
+        val rowA = OptionContractRecord(
+            tradeDate = date,
+            expiryDate = expiry,
+            strikePrice = 24000.0,
+            optionType = OptionSide.PE,
+            openPrice = 60.0,
+            highPrice = 65.0,
+            lowPrice = 48.0,
+            closePrice = 50.0,
+            prevClosePrice = 60.0,
+            settlePrice = 50.0,
+            underlyingPrice = 24100.0,
+            openInterestUnits = 650_000L,
+            changeInOiUnits = 130_000L,
+            totalTradedVolumeUnits = 325_000L,
+            totalTurnoverValue = 16_250_000.0,
+            totalTradesExecuted = 1200L,
+            lotSize = 65
+        )
+        // Conflicting duplicate row for same (tradeDate, expiryDate, strikePrice, optionType)
+        val rowB = rowA.copy(
+            openInterestUnits = 910_000L,
+            changeInOiUnits = 260_000L,
+            totalTradedVolumeUnits = 650_000L,
+            totalTurnoverValue = 32_500_000.0,
+            totalTradesExecuted = 2500L
+        )
+        val cleanCe = rowA.copy(optionType = OptionSide.CE)
+
+        val audit = MultiStrikeAnalyzer.deduplicateOptionContractsWithAudit(listOf(rowA, rowB, cleanCe))
+        assertTrue(audit.hasConflicts)
+        assertEquals(1, audit.conflictingKeys.size)
+        assertTrue(
+            audit.conflictingKeys.contains(
+                MultiStrikeAnalyzer.OptionContractKey(date, expiry, 24000.0, OptionSide.PE)
+            )
+        )
+        // Conflicting 24000 PE is quarantined (neither picked, summed, nor averaged); clean 24000 CE remains intact
+        assertEquals(1, audit.deduplicatedContracts.size)
+        assertEquals(OptionSide.CE, audit.deduplicatedContracts.first().optionType)
+    }
+
+    // Test 10: Identical duplicate futures collapse without summing; conflicting futures produce
+    // neutral/inconclusive 0.0 directional flow.
+    @Test
+    fun identicalAndConflictingFuturesSnapshots_handledSafelyWithNeutralFlowOnConflict() {
+        val d1 = LocalDate.of(2026, 2, 10)
+        val d2 = LocalDate.of(2026, 2, 11)
+        val exp = LocalDate.of(2026, 2, 26)
+
+        val prevFut = FuturesContractRecord(
+            tradeDate = d1,
+            expiryDate = exp,
+            openPrice = 24000.0,
+            highPrice = 24060.0,
+            lowPrice = 23980.0,
+            closePrice = 24050.0,
+            prevClosePrice = 24000.0,
+            settlePrice = 24050.0,
+            underlyingPrice = 24030.0,
+            openInterestUnits = 13_000_000L,
+            changeInOiUnits = 325_000L,
+            totalTradedVolumeUnits = 3_250_000L,
+            totalTradesExecuted = 15_000L,
+            lotSize = 65
+        )
+        val curFutA = prevFut.copy(
+            tradeDate = d2,
+            closePrice = 23920.0,
+            prevClosePrice = 24050.0,
+            settlePrice = 23920.0,
+            underlyingPrice = 23910.0,
+            openInterestUnits = 14_300_000L,
+            changeInOiUnits = 1_300_000L
+        )
+        val curFutConflicting = curFutA.copy(
+            openInterestUnits = 11_700_000L,
+            changeInOiUnits = -1_300_000L
+        )
+
+        // Identical duplicate futures collapse without summing
+        val identicalAudit = MultiStrikeAnalyzer.deduplicateFuturesContractsWithAudit(listOf(curFutA, curFutA.copy()))
+        assertFalse(identicalAudit.hasConflicts)
+        assertEquals(1, identicalAudit.deduplicatedContracts.size)
+        assertEquals(14_300_000L, identicalAudit.deduplicatedContracts.first().openInterestUnits)
+        assertEquals(1_300_000L, identicalAudit.deduplicatedContracts.first().changeInOiUnits)
+
+        val prevSession = SessionMarketData(
+            sessionIndex = 1,
+            tradeDate = d1,
+            contracts = emptyList(),
+            participantOi = emptyList(),
+            indexSnapshot = IndexSnapshotRecord(d1, 24000.0, 24060.0, 23980.0, 24030.0, 30.0, 0.12, 13.0),
+            volatilityRecord = DailyVolatilityRecord(d1, 24030.0, 0.008, 0.15),
+            futuresContracts = listOf(prevFut)
+        )
+        val cleanCurSession = prevSession.copy(
+            sessionIndex = 2,
+            tradeDate = d2,
+            indexSnapshot = IndexSnapshotRecord(d2, 24020.0, 24030.0, 23900.0, 23910.0, -120.0, -0.50, 14.0),
+            futuresContracts = listOf(curFutA, curFutA.copy())
+        )
+        val cleanFlow = MultiStrikeAnalyzer.computeFuturesDirectionalFlow(cleanCurSession, prevSession)
+        assertTrue("Clean short-buildup futures flow should be non-zero bearish", cleanFlow < 0.0)
+
+        // Conflicting duplicate futures snapshots must produce neutral/inconclusive 0.0 directional flow
+        val conflictedCurSession = cleanCurSession.copy(
+            futuresContracts = listOf(curFutA, curFutConflicting)
+        )
+        val conflictedFlow = MultiStrikeAnalyzer.computeFuturesDirectionalFlow(conflictedCurSession, prevSession)
+        assertEquals(0.0, conflictedFlow, 1e-9)
+    }
+
+    // Test 11: Conflicting duplicate rows on Session 22 invalidate CE resistance and PE support
+    // zones independently rather than poisoning the clean opposite side.
+    @Test
+    fun conflictingTargetExpiryZones_invalidateCeAndPeIndependently() {
+        val start = LocalDate.of(2026, 2, 1)
+        val expiry = LocalDate.of(2026, 3, 10)
+        val sessions = (0 until 22).map { idx ->
+            val date = start.plusDays(idx.toLong())
+            val spot = 24100.0
+            val contracts = mutableListOf<OptionContractRecord>()
+            for (k in listOf(23700.0, 23900.0, 24000.0, 24100.0, 24300.0, 24500.0)) {
+                val peOi = if (k == 23900.0) 14000L else if (k == 23700.0) 12500L else 2200L
+                val peDelta = if (k == 23900.0) 3400L else if (k == 23700.0) 2800L else 150L
+                val ceOi = if (k == 24300.0) 15000L else if (k == 24500.0) 13000L else 2100L
+                val ceDelta = if (k == 24300.0) 3600L else if (k == 24500.0) 2900L else 140L
+
+                contracts.add(
+                    OptionContractRecord(
+                        tradeDate = date, expiryDate = expiry, strikePrice = k, optionType = OptionSide.PE,
+                        openPrice = 60.0, highPrice = 65.0, lowPrice = 45.0, closePrice = 48.0,
+                        prevClosePrice = 62.0, settlePrice = 48.0, underlyingPrice = spot,
+                        openInterestUnits = peOi * 65L, changeInOiUnits = peDelta * 65L,
+                        totalTradedVolumeUnits = 9000L * 65L, totalTurnoverValue = 25_000_000.0,
+                        totalTradesExecuted = 400L, lotSize = 65
+                    )
+                )
+                contracts.add(
+                    OptionContractRecord(
+                        tradeDate = date, expiryDate = expiry, strikePrice = k, optionType = OptionSide.CE,
+                        openPrice = 58.0, highPrice = 63.0, lowPrice = 44.0, closePrice = 46.0,
+                        prevClosePrice = 60.0, settlePrice = 46.0, underlyingPrice = spot,
+                        openInterestUnits = ceOi * 65L, changeInOiUnits = ceDelta * 65L,
+                        totalTradedVolumeUnits = 9000L * 65L, totalTurnoverValue = 25_000_000.0,
+                        totalTradesExecuted = 400L, lotSize = 65
+                    )
+                )
+            }
+            SessionMarketData(
+                sessionIndex = idx + 1,
+                tradeDate = date,
+                contracts = contracts,
+                participantOi = listOf(
+                    ParticipantOiRecord(date, "Pro", 300_000L, 300_000L, 650_000L, 650_000L),
+                    ParticipantOiRecord(date, "FII", 250_000L, 250_000L, 650_000L, 650_000L)
+                ),
+                indexSnapshot = IndexSnapshotRecord(date, 24060.0, 24140.0, 24040.0, spot, 35.0, 0.15, 13.4),
+                volatilityRecord = DailyVolatilityRecord(date, spot, 0.0085, 0.1624)
+            )
+        }
+
+        // Case A: Inject conflicting duplicate on Session 22 at 23900 PE -> S1/S2 INCONCLUSIVE, R1/R2 still established
+        val s22 = sessions[21]
+        val orig23900Pe = s22.contracts.first { it.strikePrice == 23900.0 && it.optionType == OptionSide.PE }
+        val conflicting23900Pe = orig23900Pe.copy(
+            openInterestUnits = orig23900Pe.openInterestUnits + 200_000L,
+            changeInOiUnits = -100_000L
+        )
+        val peConflictSessions = sessions.toMutableList().apply {
+            this[21] = s22.copy(contracts = s22.contracts + conflicting23900Pe)
+        }
+        val peDiscovery = PatternDiscoveryEngine.runTwentyTwoSessionPipeline(peConflictSessions, expiry)
+        val peConflictZones = ZoneDerivationEngine.deriveNarrowZones(
+            session22 = peConflictSessions[21],
+            prevSession21 = peConflictSessions[20],
+            targetExpiry = expiry,
+            discovery = peDiscovery
+        )
+
+        assertFalse("Conflicting PE must invalidate S1", peConflictZones.s1.isEstablished)
+        assertFalse("Conflicting PE must invalidate S2", peConflictZones.s2.isEstablished)
+        assertEquals(ZoneEvidenceStrength.INCONCLUSIVE, peConflictZones.s1.strength)
+        assertEquals(ZoneEvidenceStrength.INCONCLUSIVE, peConflictZones.s2.strength)
+        assertTrue("Clean CE resistance R1 must remain independently established", peConflictZones.r1.isEstablished)
+        assertTrue("Clean CE resistance R2 must remain independently established", peConflictZones.r2.isEstablished)
+
+        // Case B: Inject conflicting duplicate on Session 22 at 24300 CE -> R1/R2 INCONCLUSIVE, S1/S2 still established
+        val orig24300Ce = s22.contracts.first { it.strikePrice == 24300.0 && it.optionType == OptionSide.CE }
+        val conflicting24300Ce = orig24300Ce.copy(
+            openInterestUnits = orig24300Ce.openInterestUnits + 250_000L,
+            changeInOiUnits = -120_000L
+        )
+        val ceConflictSessions = sessions.toMutableList().apply {
+            this[21] = s22.copy(contracts = s22.contracts + conflicting24300Ce)
+        }
+        val ceDiscovery = PatternDiscoveryEngine.runTwentyTwoSessionPipeline(ceConflictSessions, expiry)
+        val ceConflictZones = ZoneDerivationEngine.deriveNarrowZones(
+            session22 = ceConflictSessions[21],
+            prevSession21 = ceConflictSessions[20],
+            targetExpiry = expiry,
+            discovery = ceDiscovery
+        )
+
+        assertTrue("Clean PE support S1 must remain independently established", ceConflictZones.s1.isEstablished)
+        assertTrue("Clean PE support S2 must remain independently established", ceConflictZones.s2.isEstablished)
+        assertFalse("Conflicting CE must invalidate R1", ceConflictZones.r1.isEstablished)
+        assertFalse("Conflicting CE must invalidate R2", ceConflictZones.r2.isEstablished)
+        assertEquals(ZoneEvidenceStrength.INCONCLUSIVE, ceConflictZones.r1.strength)
+        assertEquals(ZoneEvidenceStrength.INCONCLUSIVE, ceConflictZones.r2.strength)
+    }
+
+    // Test 12: Earlier-session conflicting duplicates break multi-session persistence/active-defense
+    // streaks cleanly and propagate in allSessionsConflictingOptionKeys.
+    @Test
+    fun earlierSessionConflict_propagatesAndQuarantinesHistoricalEvidenceAcrossTwentyTwoSessions() {
+        val start = LocalDate.of(2026, 2, 1)
+        val expiry = LocalDate.of(2026, 3, 10)
+        val sessions = (0 until 22).map { idx ->
+            val date = start.plusDays(idx.toLong())
+            val spot = 24100.0
+            val contracts = mutableListOf<OptionContractRecord>()
+            for (k in listOf(23700.0, 23900.0, 24100.0, 24300.0, 24500.0)) {
+                val peOi = if (k == 23900.0) 14000L else 2200L
+                val peDelta = if (k == 23900.0) 3400L else 150L
+                val ceOi = if (k == 24300.0) 15000L else 2100L
+                val ceDelta = if (k == 24300.0) 3600L else 140L
+
+                contracts.add(
+                    OptionContractRecord(
+                        tradeDate = date, expiryDate = expiry, strikePrice = k, optionType = OptionSide.PE,
+                        openPrice = 60.0, highPrice = 65.0, lowPrice = 45.0, closePrice = 48.0,
+                        prevClosePrice = 62.0, settlePrice = 48.0, underlyingPrice = spot,
+                        openInterestUnits = peOi * 65L, changeInOiUnits = peDelta * 65L,
+                        totalTradedVolumeUnits = 9000L * 65L, totalTurnoverValue = 25_000_000.0,
+                        totalTradesExecuted = 400L, lotSize = 65
+                    )
+                )
+                contracts.add(
+                    OptionContractRecord(
+                        tradeDate = date, expiryDate = expiry, strikePrice = k, optionType = OptionSide.CE,
+                        openPrice = 58.0, highPrice = 63.0, lowPrice = 44.0, closePrice = 46.0,
+                        prevClosePrice = 60.0, settlePrice = 46.0, underlyingPrice = spot,
+                        openInterestUnits = ceOi * 65L, changeInOiUnits = ceDelta * 65L,
+                        totalTradedVolumeUnits = 9000L * 65L, totalTurnoverValue = 25_000_000.0,
+                        totalTradesExecuted = 400L, lotSize = 65
+                    )
+                )
+            }
+            SessionMarketData(
+                sessionIndex = idx + 1,
+                tradeDate = date,
+                contracts = contracts,
+                participantOi = listOf(
+                    ParticipantOiRecord(date, "Pro", 300_000L, 300_000L, 650_000L, 650_000L),
+                    ParticipantOiRecord(date, "FII", 250_000L, 250_000L, 650_000L, 650_000L)
+                ),
+                indexSnapshot = IndexSnapshotRecord(date, 24060.0, 24140.0, 24040.0, spot, 35.0, 0.15, 13.4),
+                volatilityRecord = DailyVolatilityRecord(date, spot, 0.0085, 0.1624)
+            )
+        }
+
+        // Inject conflicting duplicate on Session 21 (index 20) at 23900 PE while Session 22 remains clean
+        val s21 = sessions[20]
+        val origS21Pe = s21.contracts.first { it.strikePrice == 23900.0 && it.optionType == OptionSide.PE }
+        val conflictingS21Pe = origS21Pe.copy(
+            openInterestUnits = origS21Pe.openInterestUnits + 300_000L,
+            changeInOiUnits = -200_000L
+        )
+        val taintedHistorySessions = sessions.toMutableList().apply {
+            this[20] = s21.copy(contracts = s21.contracts + conflictingS21Pe)
+        }
+
+        // Persistence & active defense on Session 22 must break at Session 21 rather than trusting conflicted Session 21 OI
+        val s22Envelope = MultiStrikeAnalyzer.analyzeSessionChain(
+            session = taintedHistorySessions[21],
+            targetExpiry = expiry,
+            priorSessions = taintedHistorySessions.take(21)
+        )
+        val s22Pe23900 = s22Envelope.metrics.first {
+            it.strikePrice == 23900.0 && it.optionType == OptionSide.PE
+        }
+        assertEquals("Persistence streak must break at conflicted Session 21", 0, s22Pe23900.persistenceSessions)
+        assertEquals("Active defense count must break at conflicted Session 21", 0, s22Pe23900.activeDefenseSessions)
+
+        // PatternDiscoveryEngine must propagate earlier-session conflict in allSessionsConflictingOptionKeys
+        val discovery = PatternDiscoveryEngine.runTwentyTwoSessionPipeline(taintedHistorySessions, expiry)
+        assertFalse(discovery.session22Envelope.hasConflictingDuplicates)
+        assertTrue(
+            discovery.allSessionsConflictingOptionKeys.contains(
+                MultiStrikeAnalyzer.OptionContractKey(s21.tradeDate, expiry, 23900.0, OptionSide.PE)
+            )
+        )
     }
 
     private fun buildContract(

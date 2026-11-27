@@ -67,7 +67,8 @@ object ZoneDerivationEngine {
         val maxPersistence: Int,
         val participantAlignmentNote: String,
         val rollSourceStrike: Double?,
-        val isCrossExpiryRolled: Boolean
+        val isCrossExpiryRolled: Boolean,
+        val extractedFromClusterNote: String? = null
     )
 
     fun deriveNarrowZones(
@@ -96,37 +97,72 @@ object ZoneDerivationEngine {
         val proPutVol = participantShortVol(session22, "Pro", isCall = false)
         val fiiPutVol = participantShortVol(session22, "FII", isCall = false)
 
-        val supportMetrics = discovery.session22Metrics.filter { m ->
-            val match = matchByKey[Pair(m.optionType, m.strikePrice)]
+        val highPutOiThreshold = computeHighPercentileOiThreshold(discovery.session22Metrics, OptionSide.PE)
+        val highCallOiThreshold = computeHighPercentileOiThreshold(discovery.session22Metrics, OptionSide.CE)
+
+        // B: Use consistent provisional horizon-sigma bound (PROVISIONAL_ZONE_SEARCH_SIGMA_MAX = 3.50)
+        val supportSideInRange = discovery.session22Metrics.filter { m ->
             m.optionType == OptionSide.PE &&
                 m.strikePrice < spot &&
-                m.strikePrice >= spot * 0.94 &&
-                match != null &&
-                !match.isFilteredTailWing &&
-                !match.hasVetoSignal &&
-                m.contradictionScore < MAX_ALLOWED_CONTRADICTION &&
-                !hasConflictingSellerSignals(m, metricByKey, matchByKey) &&
-                hasActiveSellerEvidence(m, match)
-        }.sortedByDescending { it.strikePrice }
-
-        val resistanceMetrics = discovery.session22Metrics.filter { m ->
-            val match = matchByKey[Pair(m.optionType, m.strikePrice)]
+                m.volNormalizedDistance <= MultiStrikeAnalyzer.PROVISIONAL_ZONE_SEARCH_SIGMA_MAX
+        }
+        val resistanceSideInRange = discovery.session22Metrics.filter { m ->
             m.optionType == OptionSide.CE &&
                 m.strikePrice > spot &&
-                m.strikePrice <= spot * 1.06 &&
-                match != null &&
+                m.volNormalizedDistance <= MultiStrikeAnalyzer.PROVISIONAL_ZONE_SEARCH_SIGMA_MAX
+        }
+
+        val supportMetrics = supportSideInRange.filter { m ->
+            val match = matchByKey[Pair(m.optionType, m.strikePrice)]
+            match != null &&
                 !match.isFilteredTailWing &&
                 !match.hasVetoSignal &&
                 m.contradictionScore < MAX_ALLOWED_CONTRADICTION &&
                 !hasConflictingSellerSignals(m, metricByKey, matchByKey) &&
-                hasActiveSellerEvidence(m, match)
+                hasActiveSellerEvidence(m, match, highPutOiThreshold)
+        }.sortedByDescending { it.strikePrice }
+
+        val resistanceMetrics = resistanceSideInRange.filter { m ->
+            val match = matchByKey[Pair(m.optionType, m.strikePrice)]
+            match != null &&
+                !match.isFilteredTailWing &&
+                !match.hasVetoSignal &&
+                m.contradictionScore < MAX_ALLOWED_CONTRADICTION &&
+                !hasConflictingSellerSignals(m, metricByKey, matchByKey) &&
+                hasActiveSellerEvidence(m, match, highCallOiThreshold)
         }.sortedBy { it.strikePrice }
+
+        // C: Detect potential standing OI strikes that lacked independent active seller evidence
+        val supportPotentialStandingOiStrikes = supportSideInRange
+            .filter { m ->
+                val match = matchByKey[Pair(m.optionType, m.strikePrice)]
+                match != null &&
+                    !match.isFilteredTailWing &&
+                    !match.hasVetoSignal &&
+                    highPutOiThreshold > 0.0 &&
+                    m.oiLots >= highPutOiThreshold &&
+                    !hasActiveSellerEvidence(m, match, highPutOiThreshold)
+            }
+            .map { it.strikePrice }
+
+        val resistancePotentialStandingOiStrikes = resistanceSideInRange
+            .filter { m ->
+                val match = matchByKey[Pair(m.optionType, m.strikePrice)]
+                match != null &&
+                    !match.isFilteredTailWing &&
+                    !match.hasVetoSignal &&
+                    highCallOiThreshold > 0.0 &&
+                    m.oiLots >= highCallOiThreshold &&
+                    !hasActiveSellerEvidence(m, match, highCallOiThreshold)
+            }
+            .map { it.strikePrice }
 
         val supportCandidates = buildNarrowCandidates(
             orderedMetrics = supportMetrics,
             side = OptionSide.PE,
             spot = spot,
             dte = dte,
+            highOiThreshold = highPutOiThreshold,
             matchByKey = matchByKey,
             featureModel = discovery.calibratedFeatureModel,
             proNetShortDelta = proPutShortDelta,
@@ -140,6 +176,7 @@ object ZoneDerivationEngine {
             side = OptionSide.CE,
             spot = spot,
             dte = dte,
+            highOiThreshold = highCallOiThreshold,
             matchByKey = matchByKey,
             featureModel = discovery.calibratedFeatureModel,
             proNetShortDelta = proCallShortDelta,
@@ -148,44 +185,83 @@ object ZoneDerivationEngine {
             fiiShortVol = fiiCallVol
         )
 
-        val rawS1 = supportCandidates.firstOrNull {
+        // A: Evidence-first zone selection (supportCandidates & resistanceCandidates are ranked by evidence first)
+        val narrowS1 = supportCandidates.firstOrNull {
+            it.upperBound < spot && it.calibratedScore >= MIN_PRIMARY_SCORE && it.widthPoints <= HARD_MAX_WIDTH
+        }
+        val rawS1 = narrowS1 ?: supportCandidates.firstOrNull {
             it.upperBound < spot && it.calibratedScore >= MIN_PRIMARY_SCORE
         }
-        val validS1 = rawS1?.takeIf { it.widthPoints <= HARD_MAX_WIDTH }
+        val validS1 = narrowS1
 
-        val rawS2 = if (validS1 != null) {
+        val narrowS2 = if (validS1 != null) {
+            supportCandidates.firstOrNull { c ->
+                c.widthPoints <= HARD_MAX_WIDTH &&
+                    c.calibratedScore >= MIN_SECONDARY_SCORE &&
+                    c.upperBound <= validS1.lowerBound - MIN_ZONE_SEPARATION &&
+                    c.coreStrike < validS1.coreStrike
+            }
+        } else null
+        val rawS2 = narrowS2 ?: if (validS1 != null) {
             supportCandidates.firstOrNull { c ->
                 c.calibratedScore >= MIN_SECONDARY_SCORE &&
                     c.upperBound <= validS1.lowerBound - MIN_ZONE_SEPARATION &&
                     c.coreStrike < validS1.coreStrike
             }
         } else null
-        val validS2 = rawS2?.takeIf { it.widthPoints <= HARD_MAX_WIDTH }
+        val validS2 = narrowS2
 
-        val rawR1 = resistanceCandidates.firstOrNull {
+        val narrowR1 = resistanceCandidates.firstOrNull {
+            it.lowerBound > spot && it.calibratedScore >= MIN_PRIMARY_SCORE && it.widthPoints <= HARD_MAX_WIDTH
+        }
+        val rawR1 = narrowR1 ?: resistanceCandidates.firstOrNull {
             it.lowerBound > spot && it.calibratedScore >= MIN_PRIMARY_SCORE
         }
-        val validR1 = rawR1?.takeIf { it.widthPoints <= HARD_MAX_WIDTH }
+        val validR1 = narrowR1
 
-        val rawR2 = if (validR1 != null) {
+        val narrowR2 = if (validR1 != null) {
+            resistanceCandidates.firstOrNull { c ->
+                c.widthPoints <= HARD_MAX_WIDTH &&
+                    c.calibratedScore >= MIN_SECONDARY_SCORE &&
+                    c.lowerBound >= validR1.upperBound + MIN_ZONE_SEPARATION &&
+                    c.coreStrike > validR1.coreStrike
+            }
+        } else null
+        val rawR2 = narrowR2 ?: if (validR1 != null) {
             resistanceCandidates.firstOrNull { c ->
                 c.calibratedScore >= MIN_SECONDARY_SCORE &&
                     c.lowerBound >= validR1.upperBound + MIN_ZONE_SEPARATION &&
                     c.coreStrike > validR1.coreStrike
             }
         } else null
-        val validR2 = rawR2?.takeIf { it.widthPoints <= HARD_MAX_WIDTH }
+        val validR2 = narrowR2
 
-        val s1 = toFootprintZone(ZoneRole.S1, rawS1, spot, dte)
-        val s2 = toFootprintZone(ZoneRole.S2, rawS2, spot, dte)
-        val r1 = toFootprintZone(ZoneRole.R1, rawR1, spot, dte)
-        val r2 = toFootprintZone(ZoneRole.R2, rawR2, spot, dte)
+        val supportConflictingStrikes = discovery.session22Envelope.conflictingOptionKeys
+            .filter { it.expiryDate == targetExpiry && it.optionType == OptionSide.PE }
+            .map { it.strikePrice }
+            .distinct()
+            .sorted()
+        val resistanceConflictingStrikes = discovery.session22Envelope.conflictingOptionKeys
+            .filter { it.expiryDate == targetExpiry && it.optionType == OptionSide.CE }
+            .map { it.strikePrice }
+            .distinct()
+            .sorted()
+
+        val effectiveRawS1 = if (supportConflictingStrikes.isNotEmpty()) null else rawS1
+        val effectiveRawS2 = if (supportConflictingStrikes.isNotEmpty()) null else rawS2
+        val effectiveRawR1 = if (resistanceConflictingStrikes.isNotEmpty()) null else rawR1
+        val effectiveRawR2 = if (resistanceConflictingStrikes.isNotEmpty()) null else rawR2
+
+        val s1 = toFootprintZone(ZoneRole.S1, effectiveRawS1, spot, dte, supportPotentialStandingOiStrikes, supportConflictingStrikes)
+        val s2 = toFootprintZone(ZoneRole.S2, effectiveRawS2, spot, dte, supportPotentialStandingOiStrikes, supportConflictingStrikes)
+        val r1 = toFootprintZone(ZoneRole.R1, effectiveRawR1, spot, dte, resistancePotentialStandingOiStrikes, resistanceConflictingStrikes)
+        val r2 = toFootprintZone(ZoneRole.R2, effectiveRawR2, spot, dte, resistancePotentialStandingOiStrikes, resistanceConflictingStrikes)
 
         val established = listOfNotNull(
-            validS1?.let { ZoneRole.S1 to it },
-            validS2?.let { ZoneRole.S2 to it },
-            validR1?.let { ZoneRole.R1 to it },
-            validR2?.let { ZoneRole.R2 to it }
+            validS1?.takeIf { supportConflictingStrikes.isEmpty() }?.let { ZoneRole.S1 to it },
+            validS2?.takeIf { supportConflictingStrikes.isEmpty() }?.let { ZoneRole.S2 to it },
+            validR1?.takeIf { resistanceConflictingStrikes.isEmpty() }?.let { ZoneRole.R1 to it },
+            validR2?.takeIf { resistanceConflictingStrikes.isEmpty() }?.let { ZoneRole.R2 to it }
         )
 
         val strongest = established.maxByOrNull { it.second.calibratedScore }
@@ -250,6 +326,19 @@ object ZoneDerivationEngine {
         )
     }
 
+    private fun computeHighPercentileOiThreshold(
+        metrics: List<StrikeMicrostructureMetrics>,
+        side: OptionSide
+    ): Double {
+        val positiveOi = metrics
+            .filter { it.optionType == side && it.oiLots > 0.0 }
+            .map { it.oiLots }
+            .sortedDescending()
+        if (positiveOi.isEmpty()) return 0.0
+        val topIdx = max(0, (positiveOi.size * 0.20).toInt() - 1)
+        return positiveOi[topIdx]
+    }
+
     private fun hasConflictingSellerSignals(
         m: StrikeMicrostructureMetrics,
         metricByKey: Map<Pair<OptionSide, Double>, StrikeMicrostructureMetrics>,
@@ -262,20 +351,57 @@ object ZoneDerivationEngine {
         val oppMetric = metricByKey[Pair(oppositeSide, m.strikePrice)] ?: return false
         val oppMatch = matchByKey[Pair(oppositeSide, m.strikePrice)]
         if (oppMatch != null && oppMatch.hasVetoSignal) return false
+
+        // D: Preserve legitimate ATM / near-ATM short straddles where both CE and PE at the same
+        // strike exhibit retained OI addition and non-expanding premium.
+        val isAtmStraddle = MultiStrikeAnalyzer.isLegitimateAtmShortStraddle(
+            volNormalizedDistance = m.volNormalizedDistance,
+            zDelta = m.zDeltaOi,
+            prr = m.positionalRetentionRatio,
+            priceChange = m.priceChange,
+            excessDecay = m.excessPriceDecay,
+            oppZ = oppMetric.zDeltaOi,
+            oppPrr = oppMetric.positionalRetentionRatio,
+            oppPriceChange = oppMetric.priceChange,
+            oppExcessDecay = oppMetric.excessPriceDecay
+        )
+        if (isAtmStraddle) return false
+
         return oppMetric.zDeltaOi >= 1.25 && oppMetric.positionalRetentionRatio >= 0.14
     }
 
+    /**
+     * C (Reconciled): Standing OI alone is NEVER classified as active seller defence.
+     * High-percentile standing OI may support a candidate ONLY when paired with independent
+     * evidence of active defence, positional retention, or price/premium absorption behaviour.
+     */
     private fun hasActiveSellerEvidence(
         m: StrikeMicrostructureMetrics,
-        match: PatternDiscoveryEngine.StrikePatternMatch
+        match: PatternDiscoveryEngine.StrikePatternMatch,
+        highOiThreshold: Double
     ): Boolean {
         val activePatterns = match.matchedPatterns.filter {
             it != PatternId.P6_SHORT_COVERING_CAPITULATION && it != PatternId.P7_TAIL_WING_MARGIN_HEDGE
         }
         if (activePatterns.isNotEmpty()) return true
+
         val hasImpulseAndRetention = m.zDeltaOi >= 1.25 && m.positionalRetentionRatio >= 0.14 && m.iprr >= 0.035
-        val hasActiveDefense = m.activeDefenseSessions >= 2 && m.deltaOiLots > 0.0 && m.excessPriceDecay <= 0.0
-        return hasImpulseAndRetention || hasActiveDefense
+        val hasActiveDefense = m.activeDefenseSessions >= 2 && m.deltaOiLots >= 0.0 && m.excessPriceDecay <= 0.0
+
+        val hasHighStandingOi = highOiThreshold > 0.0 && m.oiLots >= highOiThreshold && m.oiLots > 0.0
+        val hasIndependentDefenceOrPriceBehaviour =
+            (m.activeDefenseSessions >= 1 && m.deltaOiLots >= 0.0 && m.excessPriceDecay <= 0.0) ||
+                (m.deltaOiLots >= 0.0 && m.positionalRetentionRatio >= 0.14 && m.excessPriceDecay < -1.0)
+        val hasSupportedStandingOiWall = hasHighStandingOi && hasIndependentDefenceOrPriceBehaviour
+
+        return hasImpulseAndRetention || hasActiveDefense || hasSupportedStandingOiWall
+    }
+
+    private fun evidenceRankingComparator(spot: Double): Comparator<NarrowZoneCandidate> {
+        return compareByDescending<NarrowZoneCandidate> { it.calibratedScore }
+            .thenByDescending { it.avgIprr }
+            .thenByDescending { it.totalOiLots }
+            .thenBy { abs(it.coreStrike - spot) }
     }
 
     private fun buildNarrowCandidates(
@@ -283,6 +409,7 @@ object ZoneDerivationEngine {
         side: OptionSide,
         spot: Double,
         dte: Long,
+        highOiThreshold: Double,
         matchByKey: Map<Pair<OptionSide, Double>, PatternDiscoveryEngine.StrikePatternMatch>,
         featureModel: PatternDiscoveryEngine.CalibratedFeatureModel,
         proNetShortDelta: Long?,
@@ -297,6 +424,7 @@ object ZoneDerivationEngine {
             val score = scoreIndividualStrike(
                 metric = m,
                 match = match,
+                highOiThreshold = highOiThreshold,
                 featureModel = featureModel,
                 proNetShortDelta = proNetShortDelta,
                 fiiNetShortDelta = fiiNetShortDelta
@@ -353,26 +481,85 @@ object ZoneDerivationEngine {
                     }
                 }
                 else -> {
-                    resultClusters.add(
-                        buildOversizedMultiStrikeCluster(
-                            run = run,
-                            side = side,
-                            proNetShortDelta = proNetShortDelta,
-                            fiiNetShortDelta = fiiNetShortDelta,
-                            proShortVol = proShortVol,
-                            fiiShortVol = fiiShortVol
-                        )
+                    // E: Extract the highest-evidence narrow core (<= HARD_MAX_WIDTH) from an oversized cluster
+                    // without artificial shrinking; fall back to diagnostic oversized rejection only if none exists.
+                    val extractedCore = extractNarrowCoreFromOversizedCluster(
+                        run = run,
+                        side = side,
+                        spot = spot,
+                        proNetShortDelta = proNetShortDelta,
+                        fiiNetShortDelta = fiiNetShortDelta,
+                        proShortVol = proShortVol,
+                        fiiShortVol = fiiShortVol
                     )
+                    if (extractedCore != null) {
+                        resultClusters.add(extractedCore)
+                    } else {
+                        resultClusters.add(
+                            buildOversizedMultiStrikeCluster(
+                                run = run,
+                                side = side,
+                                proNetShortDelta = proNetShortDelta,
+                                fiiNetShortDelta = fiiNetShortDelta,
+                                proShortVol = proShortVol,
+                                fiiShortVol = fiiShortVol
+                            )
+                        )
+                    }
                 }
             }
             idx = nextIdx
         }
 
-        return if (side == OptionSide.PE) {
-            resultClusters.sortedByDescending { it.coreStrike }
-        } else {
-            resultClusters.sortedBy { it.coreStrike }
+        // A: Rank candidates by evidence first rather than proximity to spot
+        return resultClusters.sortedWith(evidenceRankingComparator(spot))
+    }
+
+    /**
+     * E: Extracts the strongest evidence-backed narrow core (width <= [HARD_MAX_WIDTH]) from a
+     * contiguous multi-strike cluster (>= 3 strikes) without artificially shrinking zone bounds.
+     */
+    private fun extractNarrowCoreFromOversizedCluster(
+        run: List<ScoredStrikeCandidate>,
+        side: OptionSide,
+        spot: Double,
+        proNetShortDelta: Long?,
+        fiiNetShortDelta: Long?,
+        proShortVol: Long?,
+        fiiShortVol: Long?
+    ): NarrowZoneCandidate? {
+        val sortedStrikes = run.map { it.metric.strikePrice }.sorted()
+        val clusterSpan = sortedStrikes.last() - sortedStrikes.first()
+        val clusterLabel = "${run.size}-strike cluster (${sortedStrikes.first().toInt()}–${sortedStrikes.last().toInt()}, ${String.format("%.0f", clusterSpan)} pts)"
+
+        val subCandidates = mutableListOf<NarrowZoneCandidate>()
+        for (item in run) {
+            if (item.singleStrikeZone.widthPoints <= HARD_MAX_WIDTH) {
+                subCandidates.add(item.singleStrikeZone)
+            }
         }
+        for (i in 0 until run.size - 1) {
+            val pairMerged = tryBuildBalancedTwoStrikeZone(
+                first = run[i],
+                second = run[i + 1],
+                side = side,
+                spot = spot,
+                proNetShortDelta = proNetShortDelta,
+                fiiNetShortDelta = fiiNetShortDelta,
+                proShortVol = proShortVol,
+                fiiShortVol = fiiShortVol
+            )
+            if (pairMerged != null && pairMerged.widthPoints <= HARD_MAX_WIDTH) {
+                subCandidates.add(pairMerged)
+            }
+        }
+
+        val bestCore = subCandidates.minWithOrNull(evidenceRankingComparator(spot)) ?: return null
+        val note = "Extracted evidence-backed narrow core (${String.format("%.0f", bestCore.widthPoints)} pts <= 50.0 pts) from broader $clusterLabel without artificial shrinking."
+        return bestCore.copy(
+            extractedFromClusterNote = note,
+            confidenceBasis = "${bestCore.confidenceBasis} | $note"
+        )
     }
 
     private fun areBalancedAdjacentStrikes(
@@ -392,6 +579,7 @@ object ZoneDerivationEngine {
     private fun scoreIndividualStrike(
         metric: StrikeMicrostructureMetrics,
         match: PatternDiscoveryEngine.StrikePatternMatch,
+        highOiThreshold: Double,
         featureModel: PatternDiscoveryEngine.CalibratedFeatureModel,
         proNetShortDelta: Long?,
         fiiNetShortDelta: Long?
@@ -411,8 +599,12 @@ object ZoneDerivationEngine {
             if (match.historicalSampleCount >= 3) (rate - 0.50).coerceIn(-0.20, 0.25) else 0.0
         } ?: 0.0
 
-        val excessDistPct = max(0.0, abs(metric.distanceFromSpotPct) - 2.5)
-        val distancePenalty = min(0.18, excessDistPct * 0.05)
+        // B: Consistent provisional horizon-sigma distance penalty
+        val excessSigma = max(0.0, metric.volNormalizedDistance - MultiStrikeAnalyzer.PROVISIONAL_DISTANCE_PENALTY_START_SIGMA)
+        val distancePenalty = min(0.18, excessSigma * 0.08)
+
+        // C: High-percentile standing OI provides modest supporting weight when independent evidence is present
+        val standingOiSupport = if (highOiThreshold > 0.0 && metric.oiLots >= highOiThreshold) 0.04 else 0.0
 
         val participantBonus = if ((proNetShortDelta != null && proNetShortDelta > 0L) ||
             (fiiNetShortDelta != null && fiiNetShortDelta > 0L)
@@ -422,7 +614,7 @@ object ZoneDerivationEngine {
             0.0
         }
 
-        return (featureScore + patternBoost + historicalBoost + participantBonus - distancePenalty - match.falsePositivePenalty)
+        return (featureScore + patternBoost + historicalBoost + standingOiSupport + participantBonus - distancePenalty - match.falsePositivePenalty)
             .coerceIn(0.0, 1.5)
     }
 
@@ -474,9 +666,11 @@ object ZoneDerivationEngine {
             it != PatternId.P6_SHORT_COVERING_CAPITULATION && it != PatternId.P7_TAIL_WING_MARGIN_HEDGE
         }.toSet()
 
+        // F2: Require >= 5 independent OOS trading sessions before assigning rated OOS confidence
         val (confScore, confBasis) = PatternDiscoveryEngine.computeStatisticallyJustifiedConfidence(
-            trials = match.historicalSampleCount,
-            defendedRate = match.historicalDefenseRate
+            oosTrials = match.oosSampleCount,
+            oosSessionCount = match.oosSessionCount,
+            oosDefendedRate = match.oosDefenseRate
         )
 
         return NarrowZoneCandidate(
@@ -537,8 +731,9 @@ object ZoneDerivationEngine {
 
         val combinedScore = ((first.calibratedScore + second.calibratedScore) / 2.0 + 0.06).coerceIn(0.0, 1.5)
         val (confScore, confBasis) = PatternDiscoveryEngine.computeStatisticallyJustifiedConfidence(
-            trials = dominant.match.historicalSampleCount,
-            defendedRate = dominant.match.historicalDefenseRate
+            oosTrials = dominant.match.oosSampleCount,
+            oosSessionCount = dominant.match.oosSessionCount,
+            oosDefendedRate = dominant.match.oosDefenseRate
         )
 
         return NarrowZoneCandidate(
@@ -635,14 +830,17 @@ object ZoneDerivationEngine {
         if (n <= 0 || h == null || r == null || b == null) {
             return "No prior triggers for this exact pattern combination in the 22-session window."
         }
-        return "Across $n distinct historical observation(s): held ${(h * 100).toInt()}%, probed & reversed ${(r * 100).toInt()}%, broke ${(b * 100).toInt()}%."
+        return "Across $n distinct historical observation(s) (${match.oosSampleCount} OOS obs across ${match.oosSessionCount} OOS session(s)): " +
+            "held ${(h * 100).toInt()}%, probed & reversed ${(r * 100).toInt()}%, broke ${(b * 100).toInt()}%."
     }
 
     private fun toFootprintZone(
         role: ZoneRole,
         candidate: NarrowZoneCandidate?,
         spot: Double,
-        dte: Long
+        dte: Long,
+        potentialStandingOiStrikes: List<Double>,
+        conflictingDuplicateStrikes: List<Double> = emptyList()
     ): FootprintZone {
         val sideText = if (role == ZoneRole.S1 || role == ZoneRole.S2) "below" else "above"
         val defaultSide = if (role == ZoneRole.S1 || role == ZoneRole.S2) OptionSide.PE else OptionSide.CE
@@ -691,6 +889,50 @@ object ZoneDerivationEngine {
         }
 
         if (candidate == null) {
+            if (conflictingDuplicateStrikes.isNotEmpty()) {
+                val conflictStrikesLabel = conflictingDuplicateStrikes.joinToString(", ") { "${it.toInt()} $defaultSide" }
+                return FootprintZone(
+                    role = role,
+                    isEstablished = false,
+                    coreStrike = null,
+                    lowerBoundary = null,
+                    upperBoundary = null,
+                    widthPoints = null,
+                    strength = ZoneEvidenceStrength.INCONCLUSIVE,
+                    confidenceScore = null,
+                    confidenceBasis = "Inconclusive — conflicting duplicate EOD snapshots quarantined at $conflictStrikesLabel; affected zone cannot be reliably derived.",
+                    relevantStrikes = conflictingDuplicateStrikes,
+                    optionSide = defaultSide,
+                    supportingPatterns = emptyList(),
+                    sellerFootprintExplanation = "Conflicting duplicate EOD Bhavcopy rows were detected at $conflictStrikesLabel $sideText NIFTY close (${String.format("%.2f", spot)}); quarantined without summing, averaging, or picking by higher OI/volume.",
+                    historicalValidationResult = "Not applicable — zone marked INCONCLUSIVE due to conflicting duplicate EOD contract data.",
+                    totalOiLots = 0L,
+                    deltaOiLots = 0L,
+                    settlePriceAvg = 0.0,
+                    positionalRetentionRatio = 0.0,
+                    atsRatio = 0.0,
+                    persistenceSessions = 0,
+                    participantAlignment = "Conflicting duplicate EOD rows prevented reliable $defaultSide derivation.",
+                    validationSummary = "Zone marked INCONCLUSIVE because duplicate EOD rows conflicted at $conflictStrikesLabel.",
+                    session22TestResult = "INCONCLUSIVE — conflicting duplicate EOD snapshots quarantined at $conflictStrikesLabel.",
+                    selectionReason = "Conflicting duplicate EOD rows detected at $conflictStrikesLabel $sideText ${String.format("%.2f", spot)}; marked INCONCLUSIVE."
+                )
+            }
+
+            val hasStandingOiOnly = (role == ZoneRole.S1 || role == ZoneRole.R1) && potentialStandingOiStrikes.isNotEmpty()
+            val standingStrikesLabel = potentialStandingOiStrikes.take(3).joinToString(", ") { "${it.toInt()} $defaultSide" }
+            val confBasisText = if (hasStandingOiOnly) {
+                "Inconclusive / Potential standing OI only at $standingStrikesLabel — standing OI alone is not active seller defence without independent defence, retention, or premium absorption."
+            } else {
+                "Inconclusive — no statistically justified zone within 50-point limit"
+            }
+            val selectionText = if (hasStandingOiOnly) {
+                "Potential standing OI detected at $standingStrikesLabel $sideText ${String.format("%.2f", spot)}, " +
+                    "but classified INCONCLUSIVE due to insufficient independent defence, retention, or premium behaviour."
+            } else {
+                "No credible seller footprint cluster could be isolated within 50 points $sideText ${String.format("%.2f", spot)}."
+            }
+
             return FootprintZone(
                 role = role,
                 isEstablished = false,
@@ -700,11 +942,15 @@ object ZoneDerivationEngine {
                 widthPoints = null,
                 strength = ZoneEvidenceStrength.INCONCLUSIVE,
                 confidenceScore = null,
-                confidenceBasis = "Inconclusive — no statistically justified zone within 50-point limit",
-                relevantStrikes = emptyList(),
+                confidenceBasis = confBasisText,
+                relevantStrikes = if (hasStandingOiOnly) potentialStandingOiStrikes else emptyList(),
                 optionSide = defaultSide,
                 supportingPatterns = emptyList(),
-                sellerFootprintExplanation = "No concentrated seller footprint satisfied narrow-zone (<= 50 pts) evidence criteria $sideText NIFTY close (${String.format("%.2f", spot)}).",
+                sellerFootprintExplanation = if (hasStandingOiOnly) {
+                    "Potential standing OI at $standingStrikesLabel $sideText NIFTY close (${String.format("%.2f", spot)}) lacked independent active seller defence, retention, or premium absorption."
+                } else {
+                    "No concentrated seller footprint satisfied narrow-zone (<= 50 pts) evidence criteria $sideText NIFTY close (${String.format("%.2f", spot)})."
+                },
                 historicalValidationResult = "Not applicable — zone marked INCONCLUSIVE rather than forcing an unsubstantiated or overly wide range.",
                 totalOiLots = 0L,
                 deltaOiLots = 0L,
@@ -712,10 +958,10 @@ object ZoneDerivationEngine {
                 positionalRetentionRatio = 0.0,
                 atsRatio = 0.0,
                 persistenceSessions = 0,
-                participantAlignment = "Insufficient strike concentration $sideText NIFTY close (${String.format("%.2f", spot)}).",
+                participantAlignment = "Insufficient active strike defense $sideText NIFTY close (${String.format("%.2f", spot)}).",
                 validationSummary = "No validated pattern cluster satisfied narrow-zone precision rules for ${role.code}.",
-                session22TestResult = "INCONCLUSIVE — not forced.",
-                selectionReason = "No credible seller footprint cluster could be isolated within 50 points $sideText ${String.format("%.2f", spot)}."
+                session22TestResult = if (hasStandingOiOnly) "INCONCLUSIVE — potential standing OI only (not active defence)." else "INCONCLUSIVE — not forced.",
+                selectionReason = selectionText
             )
         }
 
@@ -734,10 +980,14 @@ object ZoneDerivationEngine {
                 append(", defended across ${candidate.maxPersistence} prior session(s)")
             }
             append(").")
+            if (candidate.extractedFromClusterNote != null) {
+                append(" ${candidate.extractedFromClusterNote}")
+            }
         }
 
         val directionLabel = if (candidate.side == OptionSide.PE) "support" else "resistance"
-        val orderLabel = if (role == ZoneRole.S1 || role == ZoneRole.R1) "Nearest" else "Secondary distinct"
+        val orderLabel = if (role == ZoneRole.S1 || role == ZoneRole.R1) "Highest-evidence primary" else "Secondary distinct"
+        val clusterSuffix = candidate.extractedFromClusterNote?.let { " $it" } ?: ""
 
         return FootprintZone(
             role = role,
@@ -764,7 +1014,7 @@ object ZoneDerivationEngine {
             validationSummary = candidate.historicalValidationText,
             session22TestResult = "Established on Session 22 (Contradiction ${String.format("%.2f", candidate.maxContradictionScore)} < 0.55; DTE = ${dte}d).",
             selectionReason = "$orderLabel credible $directionLabel zone relative to NIFTY close (${String.format("%.2f", spot)}), " +
-                "anchored at core ${candidate.coreStrike.toInt()} ($strikesStr) with ${String.format("%.0f", candidate.widthPoints)}-pt width.",
+                "anchored at core ${candidate.coreStrike.toInt()} ($strikesStr) with ${String.format("%.0f", candidate.widthPoints)}-pt width.$clusterSuffix",
             iprr = candidate.avgIprr,
             futuresAlignment = candidate.avgFuturesAlignment,
             contradictionScore = candidate.maxContradictionScore

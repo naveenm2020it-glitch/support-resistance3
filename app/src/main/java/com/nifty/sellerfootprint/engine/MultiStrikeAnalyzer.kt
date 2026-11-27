@@ -21,13 +21,53 @@ object MultiStrikeAnalyzer {
 
     const val IPRR_C = 0.25
 
+    // PROVISIONAL volatility/DTE-normalized distance thresholds (dimensionless sigma-units unless noted).
+    // These thresholds are provisional engineering heuristics—not empirically validated—and are shared
+    // across MultiStrikeAnalyzer, PatternDiscoveryEngine, ZoneDerivationEngine, and DomainModels.
+    const val PROVISIONAL_MIN_HORIZON_SIGMA_PCT = 0.20 // Floor in % points (0.20%) for 0-DTE stability
+    const val PROVISIONAL_CORE_GAMMA_SIGMA_MAX = 0.75 // Zone I upper bound in horizon-sigma units
+    const val PROVISIONAL_PRIMARY_WALL_SIGMA_MAX = 2.25 // Zone II upper bound in horizon-sigma units
+    const val PROVISIONAL_STRANGLE_SIGMA_MAX = 1.65 // P4 strangle wing distance bound in horizon-sigma units
+    const val PROVISIONAL_ATM_GAMMA_PIN_SIGMA_MAX = 0.25 // NP3 ATM gamma-pin distance bound in horizon-sigma units
+    const val PROVISIONAL_STRADDLE_SIGMA_MAX = 0.65 // Near-ATM short-straddle preservation bound in horizon-sigma units
+    const val PROVISIONAL_ZONE_SEARCH_SIGMA_MAX = 3.50 // Candidate search bound in horizon-sigma units
+    const val PROVISIONAL_DISTANCE_PENALTY_START_SIGMA = 1.50 // Distance penalty onset in horizon-sigma units
+
+    data class OptionContractKey(
+        val tradeDate: LocalDate,
+        val expiryDate: LocalDate,
+        val strikePrice: Double,
+        val optionType: OptionSide
+    )
+
+    data class OptionDeduplicationResult(
+        val deduplicatedContracts: List<OptionContractRecord>,
+        val conflictingKeys: Set<OptionContractKey>,
+        val identicalDuplicatesCollapsed: Int
+    ) {
+        val hasConflicts: Boolean get() = conflictingKeys.isNotEmpty()
+    }
+
+    data class FuturesDeduplicationResult(
+        val deduplicatedContracts: List<FuturesContractRecord>,
+        val conflictingKeys: Set<Pair<LocalDate, LocalDate>>,
+        val identicalDuplicatesCollapsed: Int
+    ) {
+        val hasConflicts: Boolean get() = conflictingKeys.isNotEmpty()
+    }
+
     data class ChainEnvelopeResult(
         val metrics: List<StrikeMicrostructureMetrics>,
         val envelopeMinStrike: Double,
         val envelopeMaxStrike: Double,
         val totalStrikesInExpiry: Int,
-        val retainedStrikesCount: Int
-    )
+        val retainedStrikesCount: Int,
+        val conflictingOptionKeys: Set<OptionContractKey> = emptySet(),
+        val conflictingFuturesKeys: Set<Pair<LocalDate, LocalDate>> = emptySet()
+    ) {
+        val hasConflictingDuplicates: Boolean
+            get() = conflictingOptionKeys.isNotEmpty() || conflictingFuturesKeys.isNotEmpty()
+    }
 
     private fun isReliableContract(c: OptionContractRecord): Boolean {
         if (!c.strikePrice.isFinite() || c.strikePrice <= 0.0) return false
@@ -38,13 +78,163 @@ object MultiStrikeAnalyzer {
     }
 
     /**
+     * Confirmed NSE EOD Bhavcopy deduplication & conflict-quarantine rule:
+     * - NSE F&O Bhavcopy rows are full-session EOD snapshots.
+     * - Identical duplicate rows sharing (tradeDate, expiryDate, strikePrice, optionType)
+     *   collapse into a single canonical snapshot; CE and PE remain separate.
+     * - OI, Change in OI, volume, turnover, and trade counts are NEVER summed or averaged.
+     * - If duplicate rows for the same key contain conflicting snapshot values, we do NOT
+     *   pick one by higher OI, volume, or trade count; instead the key is flagged in
+     *   [OptionDeduplicationResult.conflictingKeys] and excluded from active evidence so
+     *   affected downstream zones can be marked INCONCLUSIVE.
+     */
+    fun deduplicateOptionContractsWithAudit(contracts: List<OptionContractRecord>): OptionDeduplicationResult {
+        if (contracts.isEmpty()) {
+            return OptionDeduplicationResult(emptyList(), emptySet(), 0)
+        }
+        val grouped = LinkedHashMap<OptionContractKey, MutableList<OptionContractRecord>>(contracts.size)
+        for (c in contracts) {
+            val key = OptionContractKey(c.tradeDate, c.expiryDate, c.strikePrice, c.optionType)
+            grouped.getOrPut(key) { mutableListOf() }.add(c)
+        }
+
+        val cleanContracts = ArrayList<OptionContractRecord>(grouped.size)
+        val conflictingKeys = LinkedHashSet<OptionContractKey>()
+        var collapsedCount = 0
+
+        for ((key, rows) in grouped) {
+            if (rows.size == 1) {
+                cleanContracts.add(rows[0])
+            } else {
+                val first = rows[0]
+                val allIdentical = rows.drop(1).all { areOptionSnapshotsIdentical(first, it) }
+                if (allIdentical) {
+                    cleanContracts.add(first)
+                    collapsedCount += rows.size - 1
+                } else {
+                    conflictingKeys.add(key)
+                }
+            }
+        }
+
+        return OptionDeduplicationResult(
+            deduplicatedContracts = cleanContracts,
+            conflictingKeys = conflictingKeys,
+            identicalDuplicatesCollapsed = collapsedCount
+        )
+    }
+
+    fun deduplicateOptionContracts(contracts: List<OptionContractRecord>): List<OptionContractRecord> =
+        deduplicateOptionContractsWithAudit(contracts).deduplicatedContracts
+
+    /**
+     * Equivalent safe duplicate-snapshot handling for NIFTY Futures contracts keyed by
+     * (tradeDate, expiryDate): identical duplicates collapse into one without summing;
+     * conflicting duplicates are flagged in [FuturesDeduplicationResult.conflictingKeys]
+     * and excluded rather than choosing by higher OI/volume/trades or averaging.
+     */
+    fun deduplicateFuturesContractsWithAudit(contracts: List<FuturesContractRecord>): FuturesDeduplicationResult {
+        if (contracts.isEmpty()) {
+            return FuturesDeduplicationResult(emptyList(), emptySet(), 0)
+        }
+        val grouped = LinkedHashMap<Pair<LocalDate, LocalDate>, MutableList<FuturesContractRecord>>(contracts.size)
+        for (c in contracts) {
+            val key = Pair(c.tradeDate, c.expiryDate)
+            grouped.getOrPut(key) { mutableListOf() }.add(c)
+        }
+
+        val cleanContracts = ArrayList<FuturesContractRecord>(grouped.size)
+        val conflictingKeys = LinkedHashSet<Pair<LocalDate, LocalDate>>()
+        var collapsedCount = 0
+
+        for ((key, rows) in grouped) {
+            if (rows.size == 1) {
+                cleanContracts.add(rows[0])
+            } else {
+                val first = rows[0]
+                val allIdentical = rows.drop(1).all { areFuturesSnapshotsIdentical(first, it) }
+                if (allIdentical) {
+                    cleanContracts.add(first)
+                    collapsedCount += rows.size - 1
+                } else {
+                    conflictingKeys.add(key)
+                }
+            }
+        }
+
+        return FuturesDeduplicationResult(
+            deduplicatedContracts = cleanContracts,
+            conflictingKeys = conflictingKeys,
+            identicalDuplicatesCollapsed = collapsedCount
+        )
+    }
+
+    fun deduplicateFuturesContracts(contracts: List<FuturesContractRecord>): List<FuturesContractRecord> =
+        deduplicateFuturesContractsWithAudit(contracts).deduplicatedContracts
+
+    private fun sameFiniteOrBothNonFinite(a: Double, b: Double, eps: Double = 1e-6): Boolean {
+        if (!a.isFinite() && !b.isFinite()) return true
+        if (!a.isFinite() || !b.isFinite()) return false
+        return abs(a - b) <= eps
+    }
+
+    private fun areOptionSnapshotsIdentical(a: OptionContractRecord, b: OptionContractRecord): Boolean {
+        return a.tradeDate == b.tradeDate &&
+            a.expiryDate == b.expiryDate &&
+            sameFiniteOrBothNonFinite(a.strikePrice, b.strikePrice) &&
+            a.optionType == b.optionType &&
+            a.lotSize == b.lotSize &&
+            a.openInterestUnits == b.openInterestUnits &&
+            a.changeInOiUnits == b.changeInOiUnits &&
+            a.totalTradedVolumeUnits == b.totalTradedVolumeUnits &&
+            a.totalTradesExecuted == b.totalTradesExecuted &&
+            sameFiniteOrBothNonFinite(a.openPrice, b.openPrice) &&
+            sameFiniteOrBothNonFinite(a.highPrice, b.highPrice) &&
+            sameFiniteOrBothNonFinite(a.lowPrice, b.lowPrice) &&
+            sameFiniteOrBothNonFinite(a.closePrice, b.closePrice) &&
+            sameFiniteOrBothNonFinite(a.prevClosePrice, b.prevClosePrice) &&
+            sameFiniteOrBothNonFinite(a.settlePrice, b.settlePrice) &&
+            sameFiniteOrBothNonFinite(a.underlyingPrice, b.underlyingPrice) &&
+            sameFiniteOrBothNonFinite(a.totalTurnoverValue, b.totalTurnoverValue, eps = 1e-2)
+    }
+
+    private fun areFuturesSnapshotsIdentical(a: FuturesContractRecord, b: FuturesContractRecord): Boolean {
+        return a.tradeDate == b.tradeDate &&
+            a.expiryDate == b.expiryDate &&
+            a.lotSize == b.lotSize &&
+            a.openInterestUnits == b.openInterestUnits &&
+            a.changeInOiUnits == b.changeInOiUnits &&
+            a.totalTradedVolumeUnits == b.totalTradedVolumeUnits &&
+            a.totalTradesExecuted == b.totalTradesExecuted &&
+            sameFiniteOrBothNonFinite(a.openPrice, b.openPrice) &&
+            sameFiniteOrBothNonFinite(a.highPrice, b.highPrice) &&
+            sameFiniteOrBothNonFinite(a.lowPrice, b.lowPrice) &&
+            sameFiniteOrBothNonFinite(a.closePrice, b.closePrice) &&
+            sameFiniteOrBothNonFinite(a.prevClosePrice, b.prevClosePrice) &&
+            sameFiniteOrBothNonFinite(a.settlePrice, b.settlePrice) &&
+            sameFiniteOrBothNonFinite(a.underlyingPrice, b.underlyingPrice) &&
+            sameFiniteOrBothNonFinite(a.totalTurnoverValue, b.totalTurnoverValue, eps = 1e-2)
+    }
+
+    /**
+     * Computes consistent horizon-volatility scale in percentage points:
+     * horizonSigmaPct = max(PROVISIONAL_MIN_HORIZON_SIGMA_PCT, dailyVol * sqrt(max(1, dte)) * 100.0).
+     * Dividing |distanceFromSpotPct| by horizonSigmaPct yields dimensionless volNormalizedDistance.
+     */
+    fun computeHorizonSigmaPct(dailyVol: Double, dteDays: Long): Double {
+        val safeVol = if (dailyVol.isFinite() && dailyVol > 0.0) dailyVol else 0.0095
+        val safeDte = max(1L, dteDays).toDouble()
+        return max(PROVISIONAL_MIN_HORIZON_SIGMA_PCT, safeVol * sqrt(safeDte) * 100.0)
+    }
+
+    /**
      * Dynamically discovers the relevant active strike envelope for [session] and [targetExpiry]
-     * without restricting to ATM or a fixed strike count, and computes v3.0 unit-invariant
+     * without restricting to ATM or a fixed strike count, and computes unit-invariant
      * microstructure metrics:
      * - IPRR = sign(deltaOI) * PRR * (1 - exp(-0.25 * max(0, Z_deltaOI)))
      * - FuturesAlignment in [-1, +1] from near-month NIFTY Futures return, OI impulse, and basis change
      * - Cross-Expiry Roll detection across all listed expiries in the same Bhavcopy
-     * - Composite ContradictionScore in [0, 1]
+     * - Composite ContradictionScore in [0, 1] with near-ATM short-straddle preservation
      */
     fun analyzeSessionChain(
         session: SessionMarketData,
@@ -56,16 +246,39 @@ object MultiStrikeAnalyzer {
             return ChainEnvelopeResult(emptyList(), 0.0, 0.0, 0, 0)
         }
 
-        val expiryContracts = session.contracts
+        val optionDedup = deduplicateOptionContractsWithAudit(session.contracts)
+        val futuresDedup = deduplicateFuturesContractsWithAudit(session.futuresContracts)
+        val relevantOptionConflicts = optionDedup.conflictingKeys
+            .filter { it.expiryDate == targetExpiry }
+            .toSet()
+
+        val deduplicatedContracts = optionDedup.deduplicatedContracts
+        val expiryContracts = deduplicatedContracts
             .filter { it.expiryDate == targetExpiry && isReliableContract(it) }
         if (expiryContracts.isEmpty()) {
-            return ChainEnvelopeResult(emptyList(), 0.0, 0.0, 0, 0)
+            return ChainEnvelopeResult(
+                metrics = emptyList(),
+                envelopeMinStrike = 0.0,
+                envelopeMaxStrike = 0.0,
+                totalStrikesInExpiry = 0,
+                retainedStrikesCount = 0,
+                conflictingOptionKeys = relevantOptionConflicts,
+                conflictingFuturesKeys = futuresDedup.conflictingKeys
+            )
         }
 
         val allStrikesSorted = expiryContracts.map { it.strikePrice }.distinct().sorted()
         val totalOiAllStrikes = expiryContracts.sumOf { max(0.0, it.openInterestLotsOrNull ?: 0.0) }
         if (totalOiAllStrikes <= 0.0) {
-            return ChainEnvelopeResult(emptyList(), 0.0, 0.0, allStrikesSorted.size, 0)
+            return ChainEnvelopeResult(
+                metrics = emptyList(),
+                envelopeMinStrike = 0.0,
+                envelopeMaxStrike = 0.0,
+                totalStrikesInExpiry = allStrikesSorted.size,
+                retainedStrikesCount = 0,
+                conflictingOptionKeys = relevantOptionConflicts,
+                conflictingFuturesKeys = futuresDedup.conflictingKeys
+            )
         }
 
         // 1. 95% Cumulative OI Mass envelope centered around spot
@@ -88,8 +301,10 @@ object MultiStrikeAnalyzer {
 
         // 2. 2.5-Sigma Volatility Horizon Envelope
         val dailyVol = resolveDailyVolatility(session, priorSessions)
-        val dte = max(1L, ChronoUnit.DAYS.between(session.tradeDate, targetExpiry))
-        val sigmaMove = spot * dailyVol * sqrt(dte.toDouble()) * 2.5
+        val calendarDte = ChronoUnit.DAYS.between(session.tradeDate, targetExpiry)
+        val dte = max(1L, calendarDte)
+        val horizonSigmaPct = computeHorizonSigmaPct(dailyVol, dte)
+        val sigmaMove = spot * (horizonSigmaPct / 100.0) * 2.5
         val volLower = spot - max(sigmaMove, spot * 0.025)
         val volUpper = spot + max(sigmaMove, spot * 0.025)
 
@@ -102,7 +317,15 @@ object MultiStrikeAnalyzer {
         val retainedStrikesCount = retainedContracts.map { it.strikePrice }.distinct().size
 
         if (retainedContracts.isEmpty()) {
-            return ChainEnvelopeResult(emptyList(), envelopeMin, envelopeMax, allStrikesSorted.size, 0)
+            return ChainEnvelopeResult(
+                metrics = emptyList(),
+                envelopeMinStrike = envelopeMin,
+                envelopeMaxStrike = envelopeMax,
+                totalStrikesInExpiry = allStrikesSorted.size,
+                retainedStrikesCount = 0,
+                conflictingOptionKeys = relevantOptionConflicts,
+                conflictingFuturesKeys = futuresDedup.conflictingKeys
+            )
         }
 
         // Cross-sectional statistics for Z-score & median ATS normalization
@@ -136,23 +359,46 @@ object MultiStrikeAnalyzer {
             Pair(c.optionType, c.strikePrice) to ((dOi - meanDeltaOi) / stdDeltaOi)
         }
 
-        // Precompute IPRR per (side, strike) so cross-leg contradiction can inspect opposite-side IPRR
-        val iprrBySideAndStrike = retainedContracts.associate { c ->
+        val prrBySideAndStrike = retainedContracts.associate { c ->
             val dOi = c.changeInOiLotsOrNull ?: 0.0
             val volLots = c.tradedVolumeLotsOrNull ?: 0.0
             val prr = if (volLots > 0.0) abs(dOi) / volLots else 0.0
-            val z = (dOi - meanDeltaOi) / stdDeltaOi
+            Pair(c.optionType, c.strikePrice) to prr
+        }
+
+        // Precompute IPRR per (side, strike) so cross-leg contradiction can inspect opposite-side IPRR
+        val iprrBySideAndStrike = retainedContracts.associate { c ->
+            val dOi = c.changeInOiLotsOrNull ?: 0.0
+            val prr = prrBySideAndStrike[Pair(c.optionType, c.strikePrice)] ?: 0.0
+            val z = zBySideAndStrike[Pair(c.optionType, c.strikePrice)] ?: 0.0
             val iprrVal = computeIprr(dOi, prr, z)
             Pair(c.optionType, c.strikePrice) to iprrVal
         }
 
+        val priceChangeBySideAndStrike = retainedContracts.associate { c ->
+            val chg = if (c.prevClosePrice > 0.0) c.effectivePrice - c.prevClosePrice else 0.0
+            Pair(c.optionType, c.strikePrice) to chg
+        }
+
+        val excessDecayBySideAndStrike = retainedContracts.associate { c ->
+            val distPct = ((c.strikePrice - spot) / spot) * 100.0
+            val volNormDist = abs(distPct) / horizonSigmaPct
+            val moneynessDecay = exp(-0.35 * volNormDist)
+            val approxDelta = when (c.optionType) {
+                OptionSide.CE -> if (c.strikePrice <= spot) min(0.95, 0.5 + 0.45 * (1.0 - moneynessDecay)) else 0.5 * moneynessDecay
+                OptionSide.PE -> if (c.strikePrice >= spot) -min(0.95, 0.5 + 0.45 * (1.0 - moneynessDecay)) else -0.5 * moneynessDecay
+            }
+            val actualChg = priceChangeBySideAndStrike[Pair(c.optionType, c.strikePrice)] ?: 0.0
+            Pair(c.optionType, c.strikePrice) to (actualChg - spotDelta * approxDelta)
+        }
+
         // Next listed expiry contracts for cross-expiry roll detection
-        val nextExpiryDate = session.contracts
+        val nextExpiryDate = deduplicatedContracts
             .map { it.expiryDate }
             .filter { it.isAfter(targetExpiry) }
             .minOrNull()
         val nextExpiryContracts = if (nextExpiryDate != null) {
-            session.contracts.filter { it.expiryDate == nextExpiryDate && isReliableContract(it) }
+            deduplicatedContracts.filter { it.expiryDate == nextExpiryDate && isReliableContract(it) }
         } else {
             emptyList()
         }
@@ -160,9 +406,10 @@ object MultiStrikeAnalyzer {
         val metricsList = retainedContracts.map { contract ->
             val distPct = ((contract.strikePrice - spot) / spot) * 100.0
             val absDistPct = abs(distPct)
+            val volNormDist = absDistPct / horizonSigmaPct
             val belt = when {
-                absDistPct <= 1.2 -> StrikeBelt.CORE_GAMMA
-                absDistPct <= 3.5 -> StrikeBelt.PRIMARY_WALL
+                volNormDist <= PROVISIONAL_CORE_GAMMA_SIGMA_MAX -> StrikeBelt.CORE_GAMMA
+                volNormDist <= PROVISIONAL_PRIMARY_WALL_SIGMA_MAX -> StrikeBelt.PRIMARY_WALL
                 else -> StrikeBelt.TAIL_HEDGE
             }
 
@@ -170,27 +417,11 @@ object MultiStrikeAnalyzer {
             val deltaOiLots = contract.changeInOiLotsOrNull ?: 0.0
             val volLots = contract.tradedVolumeLotsOrNull ?: 0.0
 
-            val zDelta = (deltaOiLots - meanDeltaOi) / stdDeltaOi
-            val actualPriceChange = if (contract.prevClosePrice > 0.0) {
-                contract.effectivePrice - contract.prevClosePrice
-            } else {
-                0.0
-            }
-
-            val moneynessDecay = exp(-0.22 * absDistPct)
-            val approxDelta = when (contract.optionType) {
-                OptionSide.CE -> if (contract.strikePrice <= spot) min(0.95, 0.5 + 0.45 * (1.0 - moneynessDecay)) else 0.5 * moneynessDecay
-                OptionSide.PE -> if (contract.strikePrice >= spot) -min(0.95, 0.5 + 0.45 * (1.0 - moneynessDecay)) else -0.5 * moneynessDecay
-            }
-            val expectedPriceChange = spotDelta * approxDelta
-            val excessDecay = actualPriceChange - expectedPriceChange
-
-            val prr = if (volLots > 0.0) {
-                abs(deltaOiLots) / volLots
-            } else {
-                0.0
-            }
-            val iprr = computeIprr(deltaOiLots, prr, zDelta)
+            val zDelta = zBySideAndStrike[Pair(contract.optionType, contract.strikePrice)] ?: 0.0
+            val actualPriceChange = priceChangeBySideAndStrike[Pair(contract.optionType, contract.strikePrice)] ?: 0.0
+            val excessDecay = excessDecayBySideAndStrike[Pair(contract.optionType, contract.strikePrice)] ?: 0.0
+            val prr = prrBySideAndStrike[Pair(contract.optionType, contract.strikePrice)] ?: 0.0
+            val iprr = iprrBySideAndStrike[Pair(contract.optionType, contract.strikePrice)] ?: 0.0
 
             val ats = if (contract.totalTradesExecuted > 0) {
                 volLots / contract.totalTradesExecuted.toDouble()
@@ -211,6 +442,7 @@ object MultiStrikeAnalyzer {
                 side = contract.optionType,
                 zDelta = zDelta,
                 spot = spot,
+                horizonSigmaPct = horizonSigmaPct,
                 zMap = zBySideAndStrike
             )
 
@@ -218,7 +450,6 @@ object MultiStrikeAnalyzer {
                 contract = contract,
                 nextExpiryContracts = nextExpiryContracts
             )
-            val calendarDte = ChronoUnit.DAYS.between(session.tradeDate, targetExpiry)
             val isCrossExpiryRoll = calendarDte in 0..2 && crossExpiryRollRatio >= 0.45
 
             val futuresAlign = when (contract.optionType) {
@@ -229,7 +460,22 @@ object MultiStrikeAnalyzer {
             val oppSide = if (contract.optionType == OptionSide.PE) OptionSide.CE else OptionSide.PE
             val oppZ = zBySideAndStrike[Pair(oppSide, contract.strikePrice)] ?: 0.0
             val oppIprr = iprrBySideAndStrike[Pair(oppSide, contract.strikePrice)] ?: 0.0
+            val oppPrr = prrBySideAndStrike[Pair(oppSide, contract.strikePrice)] ?: 0.0
+            val oppPriceChg = priceChangeBySideAndStrike[Pair(oppSide, contract.strikePrice)] ?: 0.0
+            val oppExcessDecay = excessDecayBySideAndStrike[Pair(oppSide, contract.strikePrice)] ?: 0.0
             val partBiasForSide = institutionalShortBias[contract.optionType] ?: 0.0
+
+            val isNearAtmShortStraddle = isLegitimateAtmShortStraddle(
+                volNormalizedDistance = volNormDist,
+                zDelta = zDelta,
+                prr = prr,
+                priceChange = actualPriceChange,
+                excessDecay = excessDecay,
+                oppZ = oppZ,
+                oppPrr = oppPrr,
+                oppPriceChange = oppPriceChg,
+                oppExcessDecay = oppExcessDecay
+            )
 
             val contradiction = computeContradictionScore(
                 deltaOiLots = deltaOiLots,
@@ -239,7 +485,8 @@ object MultiStrikeAnalyzer {
                 oppIprr = oppIprr,
                 futuresAlignment = futuresAlign,
                 participantBiasForSide = partBiasForSide,
-                isCrossExpiryRoll = isCrossExpiryRoll
+                isCrossExpiryRoll = isCrossExpiryRoll,
+                isNearAtmShortStraddle = isNearAtmShortStraddle
             )
 
             StrikeMicrostructureMetrics(
@@ -266,7 +513,8 @@ object MultiStrikeAnalyzer {
                 futuresAlignment = futuresAlign,
                 isCrossExpiryRoll = isCrossExpiryRoll,
                 crossExpiryRollRatio = crossExpiryRollRatio,
-                contradictionScore = contradiction
+                contradictionScore = contradiction,
+                volNormalizedDistance = volNormDist
             )
         }.sortedWith(compareBy({ it.strikePrice }, { it.optionType }))
 
@@ -275,8 +523,34 @@ object MultiStrikeAnalyzer {
             envelopeMinStrike = envelopeMin,
             envelopeMaxStrike = envelopeMax,
             totalStrikesInExpiry = allStrikesSorted.size,
-            retainedStrikesCount = retainedStrikesCount
+            retainedStrikesCount = retainedStrikesCount,
+            conflictingOptionKeys = relevantOptionConflicts,
+            conflictingFuturesKeys = futuresDedup.conflictingKeys
         )
+    }
+
+    /**
+     * Identifies legitimate ATM / near-ATM short straddles where sellers write both CE and PE
+     * at the same strike within [PROVISIONAL_STRADDLE_SIGMA_MAX] and both legs exhibit retained
+     * OI addition with non-expanding premium.
+     */
+    fun isLegitimateAtmShortStraddle(
+        volNormalizedDistance: Double,
+        zDelta: Double,
+        prr: Double,
+        priceChange: Double,
+        excessDecay: Double,
+        oppZ: Double,
+        oppPrr: Double,
+        oppPriceChange: Double,
+        oppExcessDecay: Double
+    ): Boolean {
+        if (!volNormalizedDistance.isFinite() || volNormalizedDistance > PROVISIONAL_STRADDLE_SIGMA_MAX) {
+            return false
+        }
+        val selfActiveShort = zDelta >= 1.15 && prr >= 0.14 && (excessDecay <= 0.0 || priceChange <= 0.0)
+        val oppActiveShort = oppZ >= 1.15 && oppPrr >= 0.14 && (oppExcessDecay <= 0.0 || oppPriceChange <= 0.0)
+        return selfActiveShort && oppActiveShort
     }
 
     /**
@@ -299,11 +573,19 @@ object MultiStrikeAnalyzer {
         current: SessionMarketData,
         prev: SessionMarketData?
     ): Double {
-        val fut = current.nearMonthFutures ?: return 0.0
+        val curFutDedup = deduplicateFuturesContractsWithAudit(current.futuresContracts)
+        if (curFutDedup.hasConflicts) return 0.0
+        val fut = curFutDedup.deduplicatedContracts
+            .filter { !it.expiryDate.isBefore(current.tradeDate) && it.effectivePrice > 0.0 }
+            .minByOrNull { it.expiryDate } ?: return 0.0
         val spot = current.underlyingClose
         if (spot <= 0.0 || fut.effectivePrice <= 0.0) return 0.0
 
-        val prevFut = prev?.nearMonthFutures
+        val prevFutDedup = prev?.let { p -> deduplicateFuturesContractsWithAudit(p.futuresContracts) }
+        if (prevFutDedup != null && prevFutDedup.hasConflicts) return 0.0
+        val prevFut = prevFutDedup?.deduplicatedContracts
+            ?.filter { !it.expiryDate.isBefore(prev.tradeDate) && it.effectivePrice > 0.0 }
+            ?.minByOrNull { it.expiryDate }
         val refPrice = when {
             fut.prevClosePrice > 0.0 -> fut.prevClosePrice
             prevFut != null && prevFut.effectivePrice > 0.0 -> prevFut.effectivePrice
@@ -341,6 +623,7 @@ object MultiStrikeAnalyzer {
         val frontDelta = contract.changeInOiLotsOrNull ?: return 0.0
         if (frontDelta >= 0.0 || nextExpiryContracts.isEmpty()) return 0.0
 
+        val dedupedNext = deduplicateOptionContracts(nextExpiryContracts)
         val rollOffsets = listOf(0.0, 50.0, 100.0, 150.0, 200.0)
         var bestNextDelta = 0.0
         for (offset in rollOffsets) {
@@ -348,7 +631,7 @@ object MultiStrikeAnalyzer {
                 OptionSide.CE -> contract.strikePrice + offset
                 OptionSide.PE -> contract.strikePrice - offset
             }
-            val nextMatch = nextExpiryContracts.firstOrNull {
+            val nextMatch = dedupedNext.firstOrNull {
                 it.optionType == contract.optionType && it.strikePrice == targetNextStrike
             }
             val nextDelta = nextMatch?.changeInOiLotsOrNull ?: 0.0
@@ -361,6 +644,8 @@ object MultiStrikeAnalyzer {
 
     /**
      * Computes composite structural contradiction score in [0, 1] for a candidate seller wall.
+     * Legitimate near-ATM short straddles ([isNearAtmShortStraddle] == true) are protected from
+     * opposite-leg contradiction penalty.
      */
     fun computeContradictionScore(
         deltaOiLots: Double,
@@ -370,9 +655,10 @@ object MultiStrikeAnalyzer {
         oppIprr: Double,
         futuresAlignment: Double,
         participantBiasForSide: Double,
-        isCrossExpiryRoll: Boolean
+        isCrossExpiryRoll: Boolean,
+        isNearAtmShortStraddle: Boolean = false
     ): Double {
-        val cOpp = if (oppZ >= 1.15 && oppIprr > 0.0) {
+        val cOpp = if (!isNearAtmShortStraddle && oppZ >= 1.15 && oppIprr > 0.0) {
             (oppIprr / 0.25).coerceIn(0.0, 1.0)
         } else {
             0.0
@@ -459,13 +745,14 @@ object MultiStrikeAnalyzer {
         var streak = 0
         var activeDefenseCount = 0
         for (past in priorSessions.asReversed()) {
-            val sameExpiry = past.contracts.filter {
+            val dedupedPast = deduplicateOptionContracts(past.contracts)
+            val sameExpiry = dedupedPast.filter {
                 it.expiryDate == targetExpiry && it.optionType == side && isReliableContract(it)
             }
             val fallbackAll = if (sameExpiry.isNotEmpty()) {
                 sameExpiry
             } else {
-                past.contracts.filter { it.optionType == side && isReliableContract(it) }
+                dedupedPast.filter { it.optionType == side && isReliableContract(it) }
             }
             if (fallbackAll.isEmpty()) break
 
@@ -501,9 +788,12 @@ object MultiStrikeAnalyzer {
         side: OptionSide,
         zDelta: Double,
         spot: Double,
+        horizonSigmaPct: Double,
         zMap: Map<Pair<OptionSide, Double>, Double>
     ): Double? {
         if (zDelta < 1.20) return null
+        val oneSigmaPoints = spot * (horizonSigmaPct / 100.0)
+        val innerTolerance = max(50.0, oneSigmaPoints * 0.35)
         val stepCandidates = listOf(50.0, 100.0, 150.0, 200.0, 250.0)
         for (step in stepCandidates) {
             val innerStrike = when (side) {
@@ -511,8 +801,8 @@ object MultiStrikeAnalyzer {
                 OptionSide.PE -> strike + step
             }
             val innerValidSide = when (side) {
-                OptionSide.CE -> innerStrike >= spot - 100.0
-                OptionSide.PE -> innerStrike <= spot + 100.0
+                OptionSide.CE -> innerStrike >= spot - innerTolerance
+                OptionSide.PE -> innerStrike <= spot + innerTolerance
             }
             if (!innerValidSide) continue
             val innerZ = zMap[Pair(side, innerStrike)] ?: continue

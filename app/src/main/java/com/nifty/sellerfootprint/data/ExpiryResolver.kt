@@ -1,5 +1,6 @@
 package com.nifty.sellerfootprint.data
 
+import com.nifty.sellerfootprint.engine.MultiStrikeAnalyzer
 import com.nifty.sellerfootprint.model.ExpiryOption
 import com.nifty.sellerfootprint.model.OptionContractRecord
 import java.time.DayOfWeek
@@ -20,7 +21,8 @@ object ExpiryResolver {
     ): List<ExpiryOption> {
         if (contracts.isEmpty()) return emptyList()
 
-        val validContracts = contracts.filter {
+        val deduped = MultiStrikeAnalyzer.deduplicateOptionContracts(contracts)
+        val validContracts = deduped.filter {
             it.tradeDate == selectedTradingDate && !it.expiryDate.isBefore(selectedTradingDate)
         }
         if (validContracts.isEmpty()) return emptyList()
