@@ -19,31 +19,6 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Apply one-time NIFTY seller-intelligence patch bundle
-        if: hashFiles('nifty-seller-intelligence-support-resistance3-patch.tar.xz.b85') != ''
-        run: |
-          python3 - <<'PY'
-          import base64, hashlib, os
-          from pathlib import Path
-          encoded = Path("nifty-seller-intelligence-support-resistance3-patch.tar.xz.b85").read_text()
-          archive = base64.b85decode(encoded)
-          expected = "4d49750c570c9e28a2cd37f62e59baa4966f3df7aab14e68d2b26afd3f37a3d2"
-          actual = hashlib.sha256(archive).hexdigest()
-          if actual != expected:
-              raise SystemExit(f"Patch archive SHA-256 mismatch: {actual}")
-          Path(os.environ["RUNNER_TEMP"], "nifty-seller-intelligence-patch.tar.xz").write_bytes(archive)
-          PY
-          xz -dc "$RUNNER_TEMP/nifty-seller-intelligence-patch.tar.xz" > "$RUNNER_TEMP/nifty-seller-intelligence-patch.tar"
-          tar -tf "$RUNNER_TEMP/nifty-seller-intelligence-patch.tar"
-          tar -xf "$RUNNER_TEMP/nifty-seller-intelligence-patch.tar" -C .
-          rm nifty-seller-intelligence-support-resistance3-patch.tar.xz.b85
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A -- app/src/main/java/com/nifty/sellerfootprint/data/ExpiryResolver.kt app/src/main/java/com/nifty/sellerfootprint/engine/AnalysisOrchestrator.kt app/src/main/java/com/nifty/sellerfootprint/engine/MultiStrikeAnalyzer.kt app/src/main/java/com/nifty/sellerfootprint/engine/PatternDiscoveryEngine.kt app/src/main/java/com/nifty/sellerfootprint/engine/ZoneDerivationEngine.kt app/src/main/java/com/nifty/sellerfootprint/model/DomainModels.kt app/src/test/java/com/nifty/sellerfootprint/RegressionFixesVerificationTest.kt app/src/test/java/com/nifty/sellerfootprint/TwentyTwoSessionAnalyticalEngineTest.kt
-          git add -A -- nifty-seller-intelligence-support-resistance3-patch.tar.xz.b85
-          git commit -m "Apply NIFTY seller intelligence A-F2 updates [skip ci]"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
-
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -81,7 +56,7 @@ jobs:
         with:
           tag_name: apk-build-${{ github.run_number }}
           name: NIFTY Seller Footprint APK build ${{ github.run_number }}
-          body: |
+          body: | 
             APK generated after successful unit tests and Android debug build.
             Download the APK asset directly below; no artifact ZIP extraction required.
           files: app/build/outputs/apk/debug/app-debug.apk
