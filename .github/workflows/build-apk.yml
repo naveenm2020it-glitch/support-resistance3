@@ -86,7 +86,19 @@ jobs:
           git push origin "HEAD:${GITHUB_REF_NAME}"
 
       - name: Run unit tests and assemble Debug APK
-        run: gradle --no-daemon testDebugUnitTest assembleDebug
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            echo "Gradle build attempt ${attempt}/3"
+            if gradle --no-daemon --refresh-dependencies testDebugUnitTest assembleDebug; then
+              exit 0
+            fi
+            if [ "${attempt}" -lt 3 ]; then
+              echo "Build attempt failed; waiting 45 seconds before retrying dependency resolution."
+              sleep 45
+            fi
+          done
+          exit 1
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
