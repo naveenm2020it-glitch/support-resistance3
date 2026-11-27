@@ -65,7 +65,7 @@ class TwentyTwoSessionAnalyticalEngineTest {
             val contracts = mutableListOf<OptionContractRecord>()
             val strikes = listOf(22800.0, 23700.0, 23900.0, 24000.0, 24100.0, 24300.0, 24500.0, 25400.0)
             for (k in strikes) {
-                // Strong multi-session Put walls at 23900 (S1) and 23700 (S2)
+                // Strong Put walls at 23900 (S1) and 23700 (S2); both clear the Session 22 chain-wide OI-impulse threshold
                 val peOi = when (k) {
                     23900.0 -> 14000L
                     23700.0 -> 12500L
@@ -74,7 +74,7 @@ class TwentyTwoSessionAnalyticalEngineTest {
                 }
                 val peDelta = when (k) {
                     23900.0 -> 3400L
-                    23700.0 -> 2800L
+                    23700.0 -> 3200L
                     22800.0 -> 2500L
                     else -> 150L
                 }
